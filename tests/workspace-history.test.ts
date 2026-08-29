@@ -154,7 +154,7 @@ async function disposeContext(ctx: TestContext): Promise<void> {
   }
 }
 
-async function createSession(ctx: TestContext) {
+async function createSession(ctx: TestContext, sessionManager: SessionManager = SessionManager.inMemory(ctx.cwd)) {
   const model = ctx.provider.getModel();
   const result = await createAgentSession({
     cwd: ctx.cwd,
@@ -165,7 +165,7 @@ async function createSession(ctx: TestContext) {
     modelRegistry: ctx.modelRegistry,
     resourceLoader: ctx.resourceLoader,
     tools: ["read", "write", "edit"],
-    sessionManager: SessionManager.inMemory(ctx.cwd),
+    sessionManager,
     settingsManager: ctx.settingsManager,
   });
 
@@ -252,7 +252,7 @@ async function waitForText(filePath: string, expected: string, message: string):
   }, message);
 }
 
-function getTurnSnapshotFile(session: Awaited<ReturnType<typeof createSession>>, cwd: string): string {
+function getSessionHistoryDir(session: Awaited<ReturnType<typeof createSession>>, cwd: string): string {
   const workspaceHash = createHash("sha256").update(path.normalize(cwd)).digest("hex").slice(0, 24);
   return path.join(
     getWorkspaceHistoryStateDir(path.dirname(cwd)),
@@ -260,8 +260,27 @@ function getTurnSnapshotFile(session: Awaited<ReturnType<typeof createSession>>,
     workspaceHash,
     "sessions",
     session.sessionManager.getSessionId(),
-    "turn-snapshots.json",
   );
+}
+
+function getTurnSnapshotFile(session: Awaited<ReturnType<typeof createSession>>, cwd: string): string {
+  return path.join(getSessionHistoryDir(session, cwd), "turn-snapshots.json");
+}
+
+function getShadowGitDir(session: Awaited<ReturnType<typeof createSession>>, cwd: string): string {
+  return path.join(getSessionHistoryDir(session, cwd), "repo.git");
+}
+
+function getReusableGitDir(session: Awaited<ReturnType<typeof createSession>>, cwd: string): string {
+  return path.join(path.dirname(path.dirname(getSessionHistoryDir(session, cwd))), "repo.git");
+}
+
+async function pruneUnreachableGitObjects(gitDir: string, cwd: string): Promise<void> {
+  await execFileAsync("git", ["--git-dir", gitDir, "config", "gc.cruftPacks", "false"], { cwd });
+  await execFileAsync("git", ["--git-dir", gitDir, "reflog", "expire", "--expire=now", "--all"], { cwd });
+  await execFileAsync("git", ["--git-dir", gitDir, "repack", "-Ad"], { cwd });
+  await execFileAsync("git", ["--git-dir", gitDir, "prune-packed"], { cwd });
+  await execFileAsync("git", ["--git-dir", gitDir, "prune", "--expire=now"], { cwd });
 }
 
 async function readTurnSnapshots(session: Awaited<ReturnType<typeof createSession>>, cwd: string): Promise<TurnSnapshotState> {
@@ -836,6 +855,13 @@ async function testNewSessionReusesWorkspaceShadowRepo(): Promise<void> {
 
     await session1.prompt("create reusable shadow state");
     await waitFor(async () => await countSnapshots(session1, ctx1.cwd, "after") >= 1, "first session after snapshot was not created");
+    const session1GitDir = getShadowGitDir(session1, ctx1.cwd);
+    const retainedSessionRefs = await execFileAsync(
+      "git",
+      ["--git-dir", session1GitDir, "for-each-ref", "--format=%(refname)", "refs/workspace-history"],
+      { cwd: ctx1.cwd },
+    );
+    assert.match(retainedSessionRefs.stdout, /refs\/workspace-history\/snapshots\//, "session repo should retain snapshot refs");
     session1.dispose();
 
     const ctx2 = await createContextForWorkspace(ctx1.rootDir, ctx1.cwd);
@@ -853,6 +879,12 @@ async function testNewSessionReusesWorkspaceShadowRepo(): Promise<void> {
     await waitFor(async () => await pathExists(path.join(gitDir, "objects")), "second session shadow git repo should exist", 10000);
     const head = await readFile(path.join(gitDir, "HEAD"), "utf8");
     assert.match(head, /refs\/heads|[0-9a-f]{40}/, "second session should have a cloned shadow repo with HEAD");
+    const inheritedRetentionRefs = await execFileAsync(
+      "git",
+      ["--git-dir", gitDir, "for-each-ref", "--format=%(refname)", "refs/workspace-history"],
+      { cwd: ctx1.cwd },
+    );
+    assert.equal(inheritedRetentionRefs.stdout.trim(), "", "new sessions should not inherit another session's retention refs");
 
     session2.dispose();
     ctx2.provider.unregister();
@@ -1040,8 +1072,179 @@ async function testRestoreFailureDoesNotDeleteCurrentWorkspace(): Promise<void> 
   }
 }
 
+async function testBranchSnapshotsSurviveGitPrune(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    const session = await createSession(ctx);
+    const filePath = path.join(ctx.cwd, "branch-prune.txt");
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "branch-prune.txt", content: "A\n" })]),
+      fauxAssistantMessage("created A branch"),
+      fauxAssistantMessage([fauxToolCall("write", { path: "branch-prune.txt", content: "C\n" })]),
+      fauxAssistantMessage("created C branch"),
+      fauxAssistantMessage([fauxToolCall("write", { path: "branch-prune.txt", content: "D\n" })]),
+      fauxAssistantMessage("created D branch"),
+    ]);
+
+    await session.prompt("create A branch");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") === 1, "A snapshot missing");
+    await session.prompt("create C branch");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") === 2, "C snapshot missing");
+
+    const cAssistant = session.sessionManager
+      .getEntries()
+      .find((entry) => entry.type === "message" && entry.message.role === "assistant" && getMessageText(entry) === "created C branch");
+    assert.ok(cAssistant, "C assistant message should exist");
+    const cCommit = (await readTurnSnapshots(session, ctx.cwd)).turns[1]?.afterCommit;
+    assert.ok(cCommit, "C snapshot commit should exist");
+
+    await session.prompt("/undo");
+    await waitForText(filePath, "A\n", "undo should restore A before branching");
+    await session.prompt("create D branch");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") === 3, "D snapshot missing");
+    const dAssistant = session.sessionManager
+      .getEntries()
+      .find((entry) => entry.type === "message" && entry.message.role === "assistant" && getMessageText(entry) === "created D branch");
+    assert.ok(dAssistant, "D assistant message should exist");
+
+    const gitDir = getShadowGitDir(session, ctx.cwd);
+    const reusableGitDir = getReusableGitDir(session, ctx.cwd);
+    await rm(reusableGitDir, { recursive: true, force: true });
+    await writeFile(path.join(ctx.cwd, "reusable-marker.txt"), "current branch only\n", "utf8");
+    await session.prompt("/checkpoint rebuild-reusable");
+    await waitFor(async () => {
+      try {
+        await execFileAsync("git", ["--git-dir", reusableGitDir, "rev-parse", "--verify", "HEAD"], { cwd: ctx.cwd });
+        return true;
+      } catch {
+        return false;
+      }
+    }, "reusable repo should be rebuilt");
+    await assert.rejects(
+      execFileAsync("git", ["--git-dir", reusableGitDir, "cat-file", "-e", `${cCommit}^{commit}`], { cwd: ctx.cwd }),
+      "reusable repo should not copy objects reachable only from retention refs",
+    );
+
+    await pruneUnreachableGitObjects(gitDir, ctx.cwd);
+    await execFileAsync("git", ["--git-dir", gitDir, "cat-file", "-e", `${cCommit}^{commit}`], { cwd: ctx.cwd });
+
+    const cNavigation = await session.navigateTree(cAssistant!.id, { summarize: false });
+    assert.equal(cNavigation.cancelled, false, "C branch should remain restorable after Git prune");
+    assert.equal(normalizeEol(await readText(filePath)), "C\n");
+
+    const dNavigation = await session.navigateTree(dAssistant!.id, { summarize: false });
+    assert.equal(dNavigation.cancelled, false, "D branch should remain restorable after Git prune");
+    assert.equal(normalizeEol(await readText(filePath)), "D\n");
+
+    await execFileAsync(
+      "git",
+      ["--git-dir", gitDir, "update-ref", "-d", `refs/workspace-history/snapshots/${cCommit}`],
+      { cwd: ctx.cwd },
+    );
+    await pruneUnreachableGitObjects(gitDir, ctx.cwd);
+    await assert.rejects(execFileAsync("git", ["--git-dir", gitDir, "cat-file", "-e", `${cCommit}^{commit}`], { cwd: ctx.cwd }));
+
+    const leafBeforeMissingTarget = session.sessionManager.getLeafId();
+    const missingNavigation = await session.navigateTree(cAssistant!.id, { summarize: false });
+    assert.equal(missingNavigation.cancelled, true, "navigation should cancel when only the target snapshot is missing");
+    assert.equal(session.sessionManager.getLeafId(), leafBeforeMissingTarget, "cancelled navigation should preserve the current history node");
+    assert.equal(normalizeEol(await readText(filePath)), "D\n", "cancelled navigation should preserve the current workspace");
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
+async function testMissingPreviousSnapshotFallsBackToFreshBefore(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    const session = await createSession(ctx);
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "missing-snapshot.txt", content: "first\n" })]),
+      fauxAssistantMessage("created first state"),
+      fauxAssistantMessage("completed recovery turn"),
+    ]);
+
+    await session.prompt("create first state");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") === 1, "first snapshot missing");
+    const first = (await readTurnSnapshots(session, ctx.cwd)).turns[0];
+    assert.ok(first, "first turn snapshot should exist");
+    assert.notEqual(first.beforeCommit, first.afterCommit, "fixture requires a distinct after commit");
+
+    const gitDir = getShadowGitDir(session, ctx.cwd);
+    const headRef = (await execFileAsync("git", ["--git-dir", gitDir, "symbolic-ref", "HEAD"], { cwd: ctx.cwd })).stdout.trim();
+    await execFileAsync("git", ["--git-dir", gitDir, "update-ref", headRef, first.beforeCommit], { cwd: ctx.cwd });
+    await execFileAsync(
+      "git",
+      ["--git-dir", gitDir, "update-ref", "-d", `refs/workspace-history/snapshots/${first.afterCommit}`],
+      { cwd: ctx.cwd },
+    );
+    await pruneUnreachableGitObjects(gitDir, ctx.cwd);
+    await assert.rejects(execFileAsync("git", ["--git-dir", gitDir, "cat-file", "-e", `${first.afterCommit}^{commit}`], { cwd: ctx.cwd }));
+
+    await session.prompt("/checkpoint recovery-head");
+    await session.prompt("continue after stale snapshot");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") === 2, "recovery turn snapshot missing");
+
+    const recovered = (await readTurnSnapshots(session, ctx.cwd)).turns[1];
+    assert.ok(recovered?.beforeCommit, "recovery turn should receive a fresh before commit");
+    await execFileAsync("git", ["--git-dir", gitDir, "cat-file", "-e", `${recovered.beforeCommit}^{commit}`], { cwd: ctx.cwd });
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
+async function testSessionStartRebuildsSnapshotRetentionRefs(): Promise<void> {
+  const ctx1 = await createContext();
+  let ctx2: TestContext | undefined;
+  try {
+    const session1 = await createSession(ctx1);
+    ctx1.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "migration.txt", content: "migrated\n" })]),
+      fauxAssistantMessage("created migration state"),
+    ]);
+
+    await session1.prompt("create migration state");
+    await waitFor(async () => await countSnapshots(session1, ctx1.cwd, "after") === 1, "migration snapshot missing");
+    const turn = (await readTurnSnapshots(session1, ctx1.cwd)).turns[0];
+    assert.ok(turn, "migration turn should exist");
+    const gitDir = getShadowGitDir(session1, ctx1.cwd);
+    const sessionManager = session1.sessionManager;
+    session1.dispose();
+
+    const refs = await execFileAsync(
+      "git",
+      ["--git-dir", gitDir, "for-each-ref", "--format=%(refname)", "refs/workspace-history"],
+      { cwd: ctx1.cwd },
+    );
+    for (const ref of refs.stdout.split(/\r?\n/).filter((value) => value.length > 0)) {
+      await execFileAsync("git", ["--git-dir", gitDir, "update-ref", "-d", ref], { cwd: ctx1.cwd });
+    }
+
+    ctx2 = await createContextForWorkspace(ctx1.rootDir, ctx1.cwd);
+    const session2 = await createSession(ctx2, sessionManager);
+    await waitFor(async () => {
+      const rebuiltRefs = await execFileAsync(
+        "git",
+        ["--git-dir", gitDir, "for-each-ref", "--format=%(refname)", "refs/workspace-history"],
+        { cwd: ctx1.cwd },
+      );
+      return rebuiltRefs.stdout.includes(turn.beforeCommit) && rebuiltRefs.stdout.includes(turn.afterCommit);
+    }, "session start should rebuild retention refs for existing snapshots");
+
+    session2.dispose();
+    ctx2.provider.unregister();
+  } finally {
+    await disposeContext(ctx1);
+  }
+}
+
 async function main(): Promise<void> {
   const tests: Array<{ name: string; run: () => Promise<void> }> = [
+    { name: "missing previous snapshot falls back to a fresh before snapshot", run: testMissingPreviousSnapshotFallsBackToFreshBefore },
+    { name: "branch snapshots survive Git prune", run: testBranchSnapshotsSurviveGitPrune },
+    { name: "session start rebuilds snapshot retention refs", run: testSessionStartRebuildsSnapshotRetentionRefs },
     { name: "session start does not create baseline eagerly", run: testSessionStartDoesNotCreateBaselineEagerly },
     { name: "idle warmup is reused by first turn", run: testIdleWarmupIsReusedByFirstTurn },
     { name: "non-project workspace disables extension", run: testNonProjectWorkspaceDisablesExtension },

@@ -26,6 +26,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 
 const SNAPSHOT_TYPE = "workspace-history.snapshot";
+const SNAPSHOT_RETENTION_REF_PREFIX = "refs/workspace-history/snapshots";
 
 const DEFAULT_MAX_SESSIONS_PER_WORKSPACE = 3;
 const DEFAULT_MAX_WORKSPACES = 10;
@@ -51,6 +52,7 @@ const PROJECT_MARKER_FILES = [
 ];
 
 type SnapshotKind = "baseline" | "before" | "after" | "manual";
+type WorkspaceComparison = "clean" | "dirty" | "missing";
 
 interface WorkspaceSnapshot {
   v: 1;
@@ -119,6 +121,7 @@ interface RuntimeState {
   lastIndexPruneIgnoreSource?: string;
   lastExcludedWorkspacePaths?: string[];
   initializationNoticeShown?: boolean;
+  warnedMissingSnapshotCommits?: Set<string>;
 }
 
 interface NavigationPrecheckResult {
@@ -584,12 +587,13 @@ async function updateReusableShadowRepo(pi: ExtensionAPI, ctx: ExtensionContext,
   }
 
   if (!await exists(paths.reusableGitDir)) {
-    await execGit(pi, ctx, ["clone", "--bare", paths.shadowGitDir, paths.reusableGitDir]);
+    await execGit(pi, ctx, ["clone", "--bare", "--single-branch", "--no-tags", "--no-local", paths.shadowGitDir, paths.reusableGitDir]);
     await logLine(ctx, `update reusable repo cloned from=${paths.shadowGitDir} to=${paths.reusableGitDir}`, state);
     return;
   }
 
-  await execGit(pi, ctx, ["--git-dir", paths.reusableGitDir, "fetch", paths.shadowGitDir, "+refs/*:refs/*"]);
+  const reusableHeadRef = await execGit(pi, ctx, ["--git-dir", paths.reusableGitDir, "symbolic-ref", "HEAD"]);
+  await execGit(pi, ctx, ["--git-dir", paths.reusableGitDir, "fetch", "--no-tags", paths.shadowGitDir, `+HEAD:${reusableHeadRef}`]);
   await logLine(ctx, `update reusable repo fetched from=${paths.shadowGitDir} to=${paths.reusableGitDir}`, state);
 }
 
@@ -985,7 +989,15 @@ async function ensureShadowRepo(pi: ExtensionAPI, ctx: ExtensionContext, state?:
 
   const reusableGitDir = await findReusableShadowGitDir(ctx, state);
   if (reusableGitDir) {
-    await execGit(pi, ctx, ["clone", ...(reusableGitDir.shared ? ["--shared"] : []), "--bare", reusableGitDir.gitDir, paths.shadowGitDir]);
+    await execGit(pi, ctx, [
+      "clone",
+      ...(reusableGitDir.shared ? ["--shared"] : ["--no-local"]),
+      "--bare",
+      "--single-branch",
+      "--no-tags",
+      reusableGitDir.gitDir,
+      paths.shadowGitDir,
+    ]);
     await execGit(pi, ctx, await gitArgs(ctx, state, "read-tree", "HEAD"));
     await logLine(ctx, `clone repo session=${ctx.sessionManager.getSessionId()} shared=${String(reusableGitDir.shared)} from=${reusableGitDir.gitDir} gitDir=${paths.shadowGitDir}`, state);
   } else {
@@ -994,6 +1006,73 @@ async function ensureShadowRepo(pi: ExtensionAPI, ctx: ExtensionContext, state?:
   }
   await syncShadowRepoExclude(ctx, state);
   await logLine(ctx, `ensure shadow repo created done ${elapsedMs(startedAt)}ms`, state);
+}
+
+function isValidSnapshotCommit(commit: string): boolean {
+  return /^[0-9a-f]{40,64}$/i.test(commit);
+}
+
+function getSnapshotRetentionRef(commit: string): string {
+  if (!isValidSnapshotCommit(commit)) {
+    throw new Error(`invalid snapshot commit: ${commit}`);
+  }
+  return `${SNAPSHOT_RETENTION_REF_PREFIX}/${commit.toLowerCase()}`;
+}
+
+async function isSnapshotCommitAvailable(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  commit: string,
+  state?: RuntimeState,
+): Promise<boolean> {
+  await ensureShadowRepo(pi, ctx, state);
+  const result = await withTimeout(
+    pi.exec(
+      "git",
+      await gitArgs(ctx, state, "rev-parse", "--verify", "--quiet", `${commit}^{commit}`),
+      { cwd: ctx.cwd },
+    ),
+    await getGitTimeoutMs(ctx, state),
+    "git rev-parse snapshot commit",
+  );
+  if (result.code === 0) {
+    return true;
+  }
+  if (result.code === 1) {
+    return false;
+  }
+  throw new Error(result.stderr || result.stdout || "git rev-parse snapshot commit failed");
+}
+
+async function retainSnapshotCommit(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  commit: string,
+  state?: RuntimeState,
+): Promise<void> {
+  await execGit(pi, ctx, await gitArgs(ctx, state, "update-ref", getSnapshotRetentionRef(commit), commit));
+}
+
+async function warnMissingSnapshotCommit(
+  ctx: ExtensionContext,
+  commit: string,
+  source: string,
+  state?: RuntimeState,
+): Promise<void> {
+  if (!state) {
+    await logLine(ctx, `snapshot commit missing source=${source} commit=${commit}`, state);
+    return;
+  }
+  state.warnedMissingSnapshotCommits ??= new Set<string>();
+  if (state.warnedMissingSnapshotCommits.has(commit)) {
+    return;
+  }
+  state.warnedMissingSnapshotCommits.add(commit);
+  await logLine(ctx, `snapshot commit missing source=${source} commit=${commit}`, state);
+  ctx.ui.notify(
+    "A previous workspace snapshot is unavailable. Workspace history will continue from the current state.",
+    "warning",
+  );
 }
 
 async function createSnapshotCommit(
@@ -1014,6 +1093,7 @@ async function createSnapshotCommit(
         state.lastKnownShadowHead = currentHead;
       }
       if (currentHead && !await hasWorkspaceChanges(pi, ctx, state)) {
+        await retainSnapshotCommit(pi, ctx, currentHead, state);
         await touchWorkspaceAndSessionMeta(ctx, state);
         scheduleCleanup(ctx, state);
         await logLine(ctx, `snapshot commit reused label=${label} commit=${currentHead} ${elapsedMs(startedAt)}ms`, state);
@@ -1022,12 +1102,13 @@ async function createSnapshotCommit(
     }
     await stageSnapshotFiles(pi, ctx, state);
     await execGit(pi, ctx, [...(await gitCommitArgs(ctx, state, "commit", "--allow-empty", "-m", `[workspace-history] ${label}`))]);
+    const commit = await execGit(pi, ctx, await gitArgs(ctx, state, "rev-parse", "HEAD"));
+    await retainSnapshotCommit(pi, ctx, commit, state);
     await touchWorkspaceAndSessionMeta(ctx, state);
     if (!label.startsWith("after ")) {
       scheduleReusableShadowRepoUpdate(pi, ctx, state);
     }
     scheduleCleanup(ctx, state);
-    const commit = await execGit(pi, ctx, await gitArgs(ctx, state, "rev-parse", "HEAD"));
     if (state) {
       state.lastKnownShadowHead = commit;
     }
@@ -1235,6 +1316,66 @@ function isUserMessageEntry(entry: SessionEntry | undefined): entry is SessionMe
 
 function getSnapshotEntries(ctx: ExtensionContext): Array<CustomEntry<WorkspaceSnapshot>> {
   return getEntries(ctx).filter(isSnapshotEntry);
+}
+
+function getReferencedSnapshotCommits(ctx: ExtensionContext, state?: RuntimeState): string[] {
+  const commits = new Set<string>();
+  for (const turn of getTurnSnapshots(state)) {
+    commits.add(turn.beforeCommit);
+    commits.add(turn.afterCommit);
+  }
+  for (const entry of getSnapshotEntries(ctx)) {
+    if (hasSnapshotData(entry)) {
+      commits.add(entry.data.commit);
+    }
+  }
+  return [...commits].filter(isValidSnapshotCommit);
+}
+
+async function reconcileSnapshotRetentionRefs(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  state?: RuntimeState,
+): Promise<void> {
+  const referencedCommits = getReferencedSnapshotCommits(ctx, state);
+  if (referencedCommits.length === 0) {
+    return;
+  }
+
+  await ensureShadowRepo(pi, ctx, state);
+  const refsResult = await withTimeout(
+    pi.exec(
+      "git",
+      await gitArgs(ctx, state, "for-each-ref", "--format=%(refname)", SNAPSHOT_RETENTION_REF_PREFIX),
+      { cwd: ctx.cwd },
+    ),
+    await getGitTimeoutMs(ctx, state),
+    "git for-each-ref snapshot retention",
+  );
+  if (refsResult.code !== 0) {
+    throw new Error(refsResult.stderr || refsResult.stdout || "git for-each-ref snapshot retention failed");
+  }
+
+  const retainedRefs = new Set(refsResult.stdout.split(/\r?\n/).filter((ref) => ref.length > 0));
+  let retainedCount = 0;
+  let missingCount = 0;
+  for (const commit of referencedCommits) {
+    if (retainedRefs.has(getSnapshotRetentionRef(commit))) {
+      continue;
+    }
+    if (!await isSnapshotCommitAvailable(pi, ctx, commit, state)) {
+      missingCount += 1;
+      await logLine(ctx, `snapshot retention migration skipped missing commit=${commit}`, state);
+      continue;
+    }
+    await retainSnapshotCommit(pi, ctx, commit, state);
+    retainedCount += 1;
+  }
+  await logLine(
+    ctx,
+    `snapshot retention reconciled referenced=${referencedCommits.length} retained=${retainedCount} missing=${missingCount}`,
+    state,
+  );
 }
 
 function extractUserText(entry: SessionEntry | undefined): string | undefined {
@@ -1505,7 +1646,7 @@ async function isWorkspaceDirtyAgainstCommit(
   ctx: ExtensionContext,
   commit: string,
   state?: RuntimeState,
-): Promise<boolean> {
+): Promise<WorkspaceComparison> {
   const startedAt = Date.now();
   await assertWorkspaceHistoryEnabled(ctx, state, "isWorkspaceDirtyAgainstCommit");
   await ensureShadowRepo(pi, ctx, state);
@@ -1519,7 +1660,7 @@ async function isWorkspaceDirtyAgainstCommit(
   if (headCommit === commit) {
     const changed = await hasWorkspaceChanges(pi, ctx, state);
     await logLine(ctx, `dirty against commit via status ${elapsedMs(startedAt)}ms commit=${commit} changed=${String(changed)}`, state);
-    return changed;
+    return changed ? "dirty" : "clean";
   }
 
   const diffResult = await withTimeout(
@@ -1533,10 +1674,14 @@ async function isWorkspaceDirtyAgainstCommit(
   );
 
   if (diffResult.code === 1) {
-    return true;
+    return "dirty";
   }
 
   if (diffResult.code !== 0) {
+    if (!await isSnapshotCommitAvailable(pi, ctx, commit, state)) {
+      await logLine(ctx, `dirty against commit missing ${elapsedMs(startedAt)}ms commit=${commit}`, state);
+      return "missing";
+    }
     throw new Error(diffResult.stderr || diffResult.stdout || "git diff failed");
   }
 
@@ -1556,7 +1701,7 @@ async function isWorkspaceDirtyAgainstCommit(
 
   const changed = untrackedResult.stdout.trim().length > 0;
   await logLine(ctx, `dirty against commit via diff ${elapsedMs(startedAt)}ms commit=${commit} changed=${String(changed)}`, state);
-  return changed;
+  return changed ? "dirty" : "clean";
 }
 
 async function isWorkspaceDirtyAgainstSnapshot(
@@ -1564,12 +1709,22 @@ async function isWorkspaceDirtyAgainstSnapshot(
   ctx: ExtensionContext,
   snapshot: WorkspaceSnapshot | CustomEntry<WorkspaceSnapshot> | undefined,
   state?: RuntimeState,
-): Promise<boolean> {
+): Promise<WorkspaceComparison> {
   const snapshotData = getResolvedSnapshotData(snapshot);
   if (!snapshotData) {
-    return false;
+    return "clean";
   }
   return isWorkspaceDirtyAgainstCommit(pi, ctx, snapshotData.commit, state);
+}
+
+function getNavigationBlockMessage(comparison: WorkspaceComparison): string | undefined {
+  if (comparison === "missing") {
+    return "The current history node's workspace snapshot is unavailable. Run /checkpoint before switching.";
+  }
+  if (comparison === "dirty") {
+    return "The workspace has unsnapshotted changes. Run /checkpoint first, or clean them up before switching.";
+  }
+  return undefined;
 }
 
 async function restoreResolvedSnapshot(
@@ -1622,10 +1777,11 @@ async function ensureNoUnsnapshottedChanges(
   const currentSnapshot = currentLeafId ? resolveSnapshotForTreeTarget(ctx, currentLeafId, state) : undefined;
 
   try {
-    const dirty = await isWorkspaceDirtyAgainstSnapshot(pi, ctx, currentSnapshot, state);
-    if (dirty) {
-      await logLine(ctx, `${source} blocked: unsnapshotted changes currentLeaf=${currentLeafId}`, state);
-      ctx.ui.notify("The workspace has unsnapshotted changes. Run /checkpoint first, or clean them up before switching.", "error");
+    const comparison = await isWorkspaceDirtyAgainstSnapshot(pi, ctx, currentSnapshot, state);
+    const blockMessage = getNavigationBlockMessage(comparison);
+    if (blockMessage) {
+      await logLine(ctx, `${source} blocked: ${comparison} currentLeaf=${currentLeafId}`, state);
+      ctx.ui.notify(blockMessage, "error");
       return undefined;
     }
   } catch (error) {
@@ -1783,11 +1939,17 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
           await state.baselineWarmupPromise;
         }
         const warmedCommit = state.warmedBaselineCommit;
-        if (warmedCommit && !await isWorkspaceDirtyAgainstCommit(pi, ctx, warmedCommit, state)) {
+        const warmedComparison = warmedCommit
+          ? await isWorkspaceDirtyAgainstCommit(pi, ctx, warmedCommit, state)
+          : undefined;
+        if (warmedCommit && warmedComparison === "clean") {
           commit = warmedCommit;
         } else {
           if (warmedCommit) {
-            await logLine(ctx, `discard warm baseline commit=${warmedCommit} reason=workspace-changed`, state);
+            if (warmedComparison === "missing") {
+              await warnMissingSnapshotCommit(ctx, warmedCommit, "warm-baseline", state);
+            }
+            await logLine(ctx, `discard warm baseline commit=${warmedCommit} reason=${warmedComparison ?? "unavailable"}`, state);
           }
           commit = await createSnapshotCommit(pi, ctx, `before ${turnId}`, state);
         }
@@ -1799,11 +1961,14 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
         await logLine(ctx, `before snapshot start turn=${turnId} first=false prompt=${String(promptText ?? "")}`, state);
         const previousAfter = findAfterSnapshotOnCurrentBranch(ctx, state);
         if (previousAfter) {
-          const changedSincePreviousAfter = await isWorkspaceDirtyAgainstCommit(pi, ctx, previousAfter.commit, state);
-          if (!changedSincePreviousAfter) {
+          const comparison = await isWorkspaceDirtyAgainstCommit(pi, ctx, previousAfter.commit, state);
+          if (comparison === "clean") {
             commit = previousAfter.commit;
             await logLine(ctx, `reuse previous after commit for before snapshot turn=${turnId} commit=${commit}`, state);
           } else {
+            if (comparison === "missing") {
+              await warnMissingSnapshotCommit(ctx, previousAfter.commit, "before-turn", state);
+            }
             commit = await createSnapshotCommit(pi, ctx, `before ${turnId}`, state, true);
           }
         } else {
@@ -1854,6 +2019,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     state.reusableRepoUpdatePromise = undefined;
     state.disabledNoticeReason = undefined;
     state.initializationNoticeShown = false;
+    state.warnedMissingSnapshotCommits = undefined;
 
     if (!await ensureWorkspaceHistoryAvailable(ctx, state, "session_start")) {
       return;
@@ -1863,6 +2029,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     await getWorkspaceStoragePaths(ctx, state);
     await touchWorkspaceAndSessionMeta(ctx, state);
     await readTurnSnapshotState(ctx, state);
+    await reconcileSnapshotRetentionRefs(pi, ctx, state);
     scheduleCleanup(ctx, state);
     scheduleBaselineWarmup(ctx, state);
     await logLine(ctx, `session_start done ${elapsedMs(startedAt)}ms session=${ctx.sessionManager.getSessionId()}`, state);
@@ -1948,8 +2115,13 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       }
 
       let commit = state.pendingBeforeCommit;
-      const needsAfterSnapshot = !commit || await isWorkspaceDirtyAgainstCommit(pi, ctx, commit, state);
-      if (needsAfterSnapshot) {
+      const comparison = commit
+        ? await isWorkspaceDirtyAgainstCommit(pi, ctx, commit, state)
+        : "missing";
+      if (comparison !== "clean") {
+        if (commit && comparison === "missing") {
+          await warnMissingSnapshotCommit(ctx, commit, "after-turn", state);
+        }
         commit = await createSnapshotCommit(pi, ctx, `after ${state.pendingTurnId}`, state, true);
       } else {
         await logLine(ctx, `reuse before commit for after snapshot turn=${state.pendingTurnId} commit=${commit}`, state);
@@ -2022,9 +2194,10 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     const currentSnapshot = currentLeafId ? resolveSnapshotForTreeTarget(ctx, currentLeafId, state) : undefined;
 
     try {
-      const dirty = await isWorkspaceDirtyAgainstSnapshot(pi, ctx, currentSnapshot, state);
-      if (dirty) {
-        ctx.ui.notify("The workspace has unsnapshotted changes. Run /checkpoint first, or clean them up before switching.", "error");
+      const comparison = await isWorkspaceDirtyAgainstSnapshot(pi, ctx, currentSnapshot, state);
+      const blockMessage = getNavigationBlockMessage(comparison);
+      if (blockMessage) {
+        ctx.ui.notify(blockMessage, "error");
         return { cancel: true };
       }
     } catch (error) {
@@ -2041,6 +2214,15 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     }
 
     try {
+      if (!await isSnapshotCommitAvailable(pi, ctx, snapshotData.commit, state)) {
+        await logLine(
+          ctx,
+          `restore unavailable source=${state.internalNavigation ?? "tree"} target=${event.preparation.targetId} commit=${snapshotData.commit}`,
+          state,
+        );
+        ctx.ui.notify("This history node's workspace snapshot is no longer available. Navigation cancelled.", "error");
+        return { cancel: true };
+      }
       await restoreResolvedSnapshot(pi, ctx, state.internalNavigation ?? "tree", event.preparation.targetId, snapshotData, state);
     } catch (error) {
       await logLine(
