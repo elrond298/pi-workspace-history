@@ -36,6 +36,7 @@ const DEFAULT_MAX_SCAN_MS = 5_000;
 const DEFAULT_GIT_TIMEOUT_MS = 60_000;
 const SHADOW_REPO_LOCK_WAIT_MS = 5_000;
 const SHADOW_REPO_LOCK_STALE_MS = 15_000;
+const RESTORE_FILE_LOCK_RETRY_DELAYS_MS = [100, 250, 500] as const;
 const WORKSPACE_HISTORY_LOG_ENV = "PI_WORKSPACE_HISTORY_LOG";
 const PROJECT_MARKER_FILES = [
   ".git",
@@ -93,11 +94,21 @@ interface RedoState {
   stack: RedoItem[];
 }
 
+interface PendingRecoveryState {
+  version: 1;
+  commit: string;
+  workspaceTree: string;
+  createdAt: string;
+}
+
 interface RuntimeState {
   pendingTurnId?: string;
   pendingBeforeCommit?: string;
   pendingPromptText?: string;
   internalNavigation?: "undo" | "redo";
+  internalNavigationFailureReported?: boolean;
+  pendingRecovery?: PendingRecoveryState;
+  pendingRecoveryPromise?: Promise<void>;
   cachedSettings?: WorkspaceHistorySettings;
   cachedPaths?: WorkspaceStoragePaths;
   cleanupPromise?: Promise<void>;
@@ -156,6 +167,7 @@ interface WorkspaceStoragePaths {
   sessionRoot: string;
   shadowGitDir: string;
   redoFile: string;
+  recoveryFile: string;
   turnSnapshotsFile: string;
   workspaceMetaFile: string;
   sessionMetaFile: string;
@@ -438,6 +450,7 @@ async function buildWorkspaceStoragePaths(ctx: ExtensionContext, settings: Works
     sessionRoot,
     shadowGitDir: path.join(sessionRoot, "repo.git"),
     redoFile: path.join(sessionRoot, "redo.json"),
+    recoveryFile: path.join(sessionRoot, "pending-recovery.json"),
     turnSnapshotsFile: path.join(sessionRoot, "turn-snapshots.json"),
     workspaceMetaFile: path.join(workspaceRoot, "meta.json"),
     sessionMetaFile: path.join(sessionRoot, "meta.json"),
@@ -812,6 +825,12 @@ async function syncShadowRepoExclude(ctx: ExtensionContext, state?: RuntimeState
   }
 }
 
+function getGitRestoreFileOperationFailureDetail(value: unknown): string | undefined {
+  return String(value).match(
+    /(?:(?:error|warning|fatal):\s*)?(?:unable to unlink(?: old)?|failed to remove|could not reset index file)[^\r\n;]*/i,
+  )?.[0]?.trim();
+}
+
 async function execGit(pi: ExtensionAPI, ctx: ExtensionContext, args: string[]): Promise<string> {
   const state = undefined;
   const timeoutMs = await getGitTimeoutMs(ctx, state);
@@ -824,17 +843,24 @@ async function execGit(pi: ExtensionAPI, ctx: ExtensionContext, args: string[]):
     await waitForShadowRepoIndexLock(ctx, state);
   }
   const result = await runGit();
-  if (result.code !== 0) {
+  const successfulRestoreFailure = result.code === 0
+    ? getGitRestoreFileOperationFailureDetail(result.stderr)
+    : undefined;
+  if (result.code !== 0 || successfulRestoreFailure) {
     const output = result.stderr || result.stdout;
-    if (usesShadowGitDir && output.includes("index.lock") && (await waitForShadowRepoIndexLock(ctx, state) || await clearStaleShadowRepoIndexLock(ctx, state))) {
+    if (result.code !== 0 && usesShadowGitDir && output.includes("index.lock") && (await waitForShadowRepoIndexLock(ctx, state) || await clearStaleShadowRepoIndexLock(ctx, state))) {
       const retry = await runGit();
-      if (retry.code === 0) {
+      const retryRestoreFailure = retry.code === 0
+        ? getGitRestoreFileOperationFailureDetail(retry.stderr)
+        : undefined;
+      if (retry.code === 0 && !retryRestoreFailure) {
         await logLine(ctx, `git ok retry ${elapsedMs(startedAt)}ms ${summarizeGitArgs(args)}`, state).catch(() => undefined);
         return retry.stdout.trim();
       }
       throw new Error(`git ${args.join(" ")} failed after clearing stale index.lock: ${retry.stderr || retry.stdout}`);
     }
-    throw new Error(`git ${args.join(" ")} failed: ${output}`);
+    const failureReason = successfulRestoreFailure ? "reported an incomplete workspace update" : "failed";
+    throw new Error(`git ${args.join(" ")} ${failureReason}: ${output}`);
   }
   if (usesShadowGitDir) {
     await logLine(ctx, `git ok ${elapsedMs(startedAt)}ms ${summarizeGitArgs(args)}`, state).catch(() => undefined);
@@ -1156,6 +1182,106 @@ async function restoreSnapshotCommit(pi: ExtensionAPI, ctx: ExtensionContext, co
   }
 }
 
+function isTransientWindowsRestoreError(error: unknown): boolean {
+  return process.platform === "win32" && getGitRestoreFileOperationFailureDetail(error) !== undefined;
+}
+
+async function restoreSnapshotCommitWithRetry(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  commit: string,
+  state?: RuntimeState,
+): Promise<void> {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      await restoreSnapshotCommit(pi, ctx, commit, state);
+      return;
+    } catch (error) {
+      const delayMs = RESTORE_FILE_LOCK_RETRY_DELAYS_MS[attempt];
+      if (delayMs === undefined || !isTransientWindowsRestoreError(error)) {
+        throw error;
+      }
+      await logLine(
+        ctx,
+        `restore retry commit=${commit} attempt=${attempt + 2} delayMs=${delayMs} error=${String(error)}`,
+        state,
+      ).catch(() => undefined);
+      await sleep(delayMs);
+    }
+  }
+}
+
+async function realignShadowRepoAfterFailedRollback(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  commit: string,
+  state?: RuntimeState,
+): Promise<void> {
+  await execGit(pi, ctx, await gitArgs(ctx, state, "reset", "--mixed", "--no-refresh", commit));
+  if (state) {
+    state.lastKnownShadowHead = commit;
+  }
+}
+
+async function captureManagedWorkspaceTree(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  commit: string,
+  state?: RuntimeState,
+): Promise<string> {
+  try {
+    await stageSnapshotFiles(pi, ctx, state);
+    return await execGit(pi, ctx, await gitArgs(ctx, state, "write-tree"));
+  } finally {
+    await realignShadowRepoAfterFailedRollback(pi, ctx, commit, state);
+  }
+}
+
+function isPendingRecoveryState(value: unknown): value is PendingRecoveryState {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const candidate = value as Partial<PendingRecoveryState>;
+  return candidate.version === 1 &&
+    typeof candidate.commit === "string" &&
+    isValidSnapshotCommit(candidate.commit) &&
+    typeof candidate.workspaceTree === "string" &&
+    isValidSnapshotCommit(candidate.workspaceTree) &&
+    typeof candidate.createdAt === "string";
+}
+
+async function readPendingRecoveryState(ctx: ExtensionContext, state?: RuntimeState): Promise<PendingRecoveryState | undefined> {
+  const paths = await getWorkspaceStoragePaths(ctx, state);
+  const recovery = await readJsonFile<unknown>(paths.recoveryFile);
+  return isPendingRecoveryState(recovery) ? recovery : undefined;
+}
+
+async function writePendingRecoveryState(
+  ctx: ExtensionContext,
+  recovery: PendingRecoveryState,
+  state?: RuntimeState,
+): Promise<void> {
+  if (state) {
+    state.pendingRecovery = recovery;
+  }
+  const paths = await ensureStorageDirs(ctx, state);
+  await writeJsonFile(paths.recoveryFile, recovery);
+}
+
+async function clearPendingRecoveryState(ctx: ExtensionContext, state?: RuntimeState): Promise<void> {
+  const paths = await getWorkspaceStoragePaths(ctx, state);
+  try {
+    await unlink(paths.recoveryFile);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw error;
+    }
+  }
+  if (state) {
+    state.pendingRecovery = undefined;
+  }
+}
+
 async function restoreSnapshotCommitSafely(
   pi: ExtensionAPI,
   ctx: ExtensionContext,
@@ -1166,18 +1292,126 @@ async function restoreSnapshotCommitSafely(
   const rollbackCommit = await createSnapshotCommit(pi, ctx, `rollback ${randomUUID()}`, state);
 
   try {
-    await restoreSnapshotCommit(pi, ctx, targetCommit, state);
+    await restoreSnapshotCommitWithRetry(pi, ctx, targetCommit, state);
     await touchWorkspaceAndSessionMeta(ctx, state);
     scheduleCleanup(ctx, state);
   } catch (error) {
     try {
-      await restoreSnapshotCommit(pi, ctx, rollbackCommit, state);
+      await restoreSnapshotCommitWithRetry(pi, ctx, rollbackCommit, state);
     } catch (rollbackError) {
+      try {
+        await realignShadowRepoAfterFailedRollback(pi, ctx, rollbackCommit, state);
+      } catch (realignError) {
+        throw new Error(
+          `restore failed: ${String(error)}; rollback failed: ${String(rollbackError)}; shadow realignment failed: ${String(realignError)}`,
+        );
+      }
+      try {
+        const recovery: PendingRecoveryState = {
+          version: 1,
+          commit: rollbackCommit,
+          workspaceTree: await captureManagedWorkspaceTree(pi, ctx, rollbackCommit, state),
+          createdAt: new Date().toISOString(),
+        };
+        await writePendingRecoveryState(ctx, recovery, state);
+      } catch (recoveryStateError) {
+        throw new Error(
+          `restore failed: ${String(error)}; rollback failed: ${String(rollbackError)}; recovery state failed: ${String(recoveryStateError)}`,
+        );
+      }
       throw new Error(
         `restore failed: ${String(error)}; rollback failed: ${String(rollbackError)}`,
       );
     }
     throw error;
+  }
+}
+
+function getRestoreFailureNotification(error: unknown): string {
+  const detail = getGitRestoreFileOperationFailureDetail(error);
+  if (!detail) {
+    return "Workspace restore failed. Tree navigation cancelled.";
+  }
+  return `Workspace restore failed. Tree navigation cancelled. Git: ${detail}. Close any program using this file, then retry.`;
+}
+
+class PendingRecoveryWorkspaceChangedError extends Error {
+  constructor() {
+    super("workspace changed after an incomplete restore");
+    this.name = "PendingRecoveryWorkspaceChangedError";
+  }
+}
+
+async function recoverPendingWorkspace(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  state: RuntimeState | undefined,
+): Promise<void> {
+  const recovery = state?.pendingRecovery;
+  if (!recovery) {
+    return;
+  }
+  if (state.pendingRecoveryPromise) {
+    await state.pendingRecoveryPromise;
+    return;
+  }
+
+  const recoveryPromise = (async () => {
+    await logLine(ctx, `pending workspace recovery start commit=${recovery.commit}`, state);
+    const currentTree = await captureManagedWorkspaceTree(pi, ctx, recovery.commit, state);
+    if (currentTree !== recovery.workspaceTree) {
+      throw new PendingRecoveryWorkspaceChangedError();
+    }
+    await restoreSnapshotCommitWithRetry(pi, ctx, recovery.commit, state);
+    await clearPendingRecoveryState(ctx, state);
+    await touchWorkspaceAndSessionMeta(ctx, state);
+    scheduleCleanup(ctx, state);
+    await logLine(ctx, `pending workspace recovery done commit=${recovery.commit}`, state);
+  })();
+  state.pendingRecoveryPromise = recoveryPromise;
+  try {
+    await recoveryPromise;
+  } finally {
+    if (state.pendingRecoveryPromise === recoveryPromise) {
+      state.pendingRecoveryPromise = undefined;
+    }
+  }
+}
+
+async function tryRecoverPendingWorkspace(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  state: RuntimeState | undefined,
+  action: string,
+  preserveChangedWorkspace = false,
+): Promise<boolean> {
+  try {
+    await recoverPendingWorkspace(pi, ctx, state);
+    return true;
+  } catch (error) {
+    await logLine(ctx, `pending workspace recovery failed action=${action} error=${String(error)}`, state).catch(() => undefined);
+    if (error instanceof PendingRecoveryWorkspaceChangedError) {
+      if (preserveChangedWorkspace) {
+        try {
+          await clearPendingRecoveryState(ctx, state);
+          await logLine(ctx, `pending workspace recovery preserved by checkpoint action=${action}`, state);
+          return true;
+        } catch (clearError) {
+          await logLine(ctx, `pending workspace recovery clear failed action=${action} error=${String(clearError)}`, state).catch(() => undefined);
+        }
+      }
+      ctx.ui.notify(
+        "The workspace changed after an incomplete restore. Run /checkpoint to preserve those changes before switching.",
+        "error",
+      );
+      return false;
+    }
+    const detail = getGitRestoreFileOperationFailureDetail(error);
+    const message = detail
+      ? `Workspace recovery failed. ${action} cancelled. Git: ${detail}. Close any program using this file, then retry.`
+      : `Workspace recovery failed. ${action} cancelled.`;
+    ctx.ui.notify(message, "error");
+    return false;
   }
 }
 
@@ -1328,6 +1562,9 @@ function getReferencedSnapshotCommits(ctx: ExtensionContext, state?: RuntimeStat
     if (hasSnapshotData(entry)) {
       commits.add(entry.data.commit);
     }
+  }
+  if (state?.pendingRecovery) {
+    commits.add(state.pendingRecovery.commit);
   }
   return [...commits].filter(isValidSnapshotCommit);
 }
@@ -1773,6 +2010,11 @@ async function ensureNoUnsnapshottedChanges(
   source: string,
   state?: RuntimeState,
 ): Promise<NavigationPrecheckResult | undefined> {
+  const action = `${source.slice(0, 1).toUpperCase()}${source.slice(1)}`;
+  if (!await tryRecoverPendingWorkspace(pi, ctx, state, action)) {
+    return undefined;
+  }
+
   const currentLeafId = ctx.sessionManager.getLeafId() ?? undefined;
   const currentSnapshot = currentLeafId ? resolveSnapshotForTreeTarget(ctx, currentLeafId, state) : undefined;
 
@@ -1919,6 +2161,10 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     }
 
     const beforeSnapshotPromise = (async () => {
+      if (!await tryRecoverPendingWorkspace(pi, ctx, state, "New turn")) {
+        throw new Error("workspace recovery is incomplete");
+      }
+
       const startedAt = Date.now();
       cancelBaselineWarmup(state);
       await clearRedoStack(ctx, state);
@@ -2008,6 +2254,9 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     state.pendingPromptText = undefined;
     state.pendingBeforeSnapshotPrompt = undefined;
     state.internalNavigation = undefined;
+    state.internalNavigationFailureReported = undefined;
+    state.pendingRecovery = undefined;
+    state.pendingRecoveryPromise = undefined;
     state.initialSnapshotCommit = undefined;
     state.warmedBaselineCommit = undefined;
     state.baselineWarmupTimer = undefined;
@@ -2027,6 +2276,10 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
 
     await getWorkspaceHistorySettings(ctx, state);
     await getWorkspaceStoragePaths(ctx, state);
+    state.pendingRecovery = await readPendingRecoveryState(ctx, state);
+    if (state.pendingRecovery) {
+      await logLine(ctx, `pending workspace recovery loaded commit=${state.pendingRecovery.commit}`, state);
+    }
     await touchWorkspaceAndSessionMeta(ctx, state);
     await readTurnSnapshotState(ctx, state);
     await reconcileSnapshotRetentionRefs(pi, ctx, state);
@@ -2184,9 +2437,27 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       `session_before_tree target=${event.preparation.targetId} oldLeaf=${event.preparation.oldLeafId} summarize=${String(event.preparation.userWantsSummary)} source=${state.internalNavigation ?? "tree"}`,
       state,
     );
+    const cancelNavigation = (message: string) => {
+      if (state.internalNavigation) {
+        state.internalNavigationFailureReported = true;
+      }
+      ctx.ui.notify(message, "error");
+      return { cancel: true as const };
+    };
 
     if (event.preparation.userWantsSummary && !state.internalNavigation) {
-      ctx.ui.notify("Manual /tree with summary may desync workspace and chat state. Disable summary before switching.", "error");
+      return cancelNavigation("Manual /tree with summary may desync workspace and chat state. Disable summary before switching.");
+    }
+
+    const action = state.internalNavigation === "undo"
+      ? "Undo"
+      : state.internalNavigation === "redo"
+        ? "Redo"
+        : "Tree navigation";
+    if (!await tryRecoverPendingWorkspace(pi, ctx, state, action)) {
+      if (state.internalNavigation) {
+        state.internalNavigationFailureReported = true;
+      }
       return { cancel: true };
     }
 
@@ -2197,20 +2468,17 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       const comparison = await isWorkspaceDirtyAgainstSnapshot(pi, ctx, currentSnapshot, state);
       const blockMessage = getNavigationBlockMessage(comparison);
       if (blockMessage) {
-        ctx.ui.notify(blockMessage, "error");
-        return { cancel: true };
+        return cancelNavigation(blockMessage);
       }
     } catch (error) {
       await logLine(ctx, `dirty-check failed target=${event.preparation.targetId} error=${String(error)}`, state);
-      ctx.ui.notify("Workspace dirty check failed. Tree navigation cancelled.", "error");
-      return { cancel: true };
+      return cancelNavigation("Workspace dirty check failed. Tree navigation cancelled.");
     }
 
     const snapshot = resolveSnapshotForTreeTarget(ctx, event.preparation.targetId, state);
     const snapshotData = getResolvedSnapshotData(snapshot);
     if (!snapshotData) {
-      ctx.ui.notify("This history node has no workspace snapshot. Cannot restore precisely.", "error");
-      return { cancel: true };
+      return cancelNavigation("This history node has no workspace snapshot. Cannot restore precisely.");
     }
 
     try {
@@ -2220,8 +2488,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
           `restore unavailable source=${state.internalNavigation ?? "tree"} target=${event.preparation.targetId} commit=${snapshotData.commit}`,
           state,
         );
-        ctx.ui.notify("This history node's workspace snapshot is no longer available. Navigation cancelled.", "error");
-        return { cancel: true };
+        return cancelNavigation("This history node's workspace snapshot is no longer available. Navigation cancelled.");
       }
       await restoreResolvedSnapshot(pi, ctx, state.internalNavigation ?? "tree", event.preparation.targetId, snapshotData, state);
     } catch (error) {
@@ -2230,8 +2497,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
         `restore source=${state.internalNavigation ?? "tree"} target=${event.preparation.targetId} kind=${snapshotData.kind} commit=${snapshotData.commit} error=${String(error)}`,
         state,
       );
-      ctx.ui.notify("Workspace restore failed. Tree navigation cancelled.", "error");
-      return { cancel: true };
+      return cancelNavigation(getRestoreFailureNotification(error));
     }
 
     return undefined;
@@ -2275,11 +2541,14 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       );
 
       state.internalNavigation = "undo";
+      state.internalNavigationFailureReported = false;
       try {
         const result = await ctx.navigateTree(after.userEntryId, { summarize: false });
         await logLine(ctx, `undo navigate result cancelled=${String(result.cancelled)}`, state);
         if (result.cancelled) {
-          ctx.ui.notify("Undo cancelled.", "error");
+          if (!state.internalNavigationFailureReported) {
+            ctx.ui.notify("Undo cancelled.", "error");
+          }
           return;
         }
 
@@ -2295,6 +2564,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
         ctx.ui.notify("Undo complete. Workspace restored to before that turn.", "info");
       } finally {
         state.internalNavigation = undefined;
+        state.internalNavigationFailureReported = undefined;
       }
     },
   });
@@ -2322,11 +2592,14 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       await logLine(ctx, `redo start currentLeaf=${ctx.sessionManager.getLeafId()} target=${redo.targetId}`, state);
 
       state.internalNavigation = "redo";
+      state.internalNavigationFailureReported = false;
       try {
         const result = await ctx.navigateTree(redo.targetId, { summarize: false });
         await logLine(ctx, `redo navigate result cancelled=${String(result.cancelled)}`, state);
         if (result.cancelled) {
-          ctx.ui.notify("Redo cancelled.", "error");
+          if (!state.internalNavigationFailureReported) {
+            ctx.ui.notify("Redo cancelled.", "error");
+          }
           return;
         }
 
@@ -2335,6 +2608,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
         ctx.ui.notify("Redo complete. Workspace restored.", "info");
       } finally {
         state.internalNavigation = undefined;
+        state.internalNavigationFailureReported = undefined;
       }
     },
   });
@@ -2346,6 +2620,9 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
 
       const state = getState(ctx);
       if (!await ensureWorkspaceHistoryAvailable(ctx, state, "checkpoint")) {
+        return;
+      }
+      if (!await tryRecoverPendingWorkspace(pi, ctx, state, "Checkpoint", true)) {
         return;
       }
       await ensureShadowRepo(pi, ctx, state);

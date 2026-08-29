@@ -121,6 +121,8 @@ Default exclusions:
 
 During restore, the plugin restores only the managed file set instead of doing a broad destructive cleanup of the entire workspace.
 
+On Windows, restore operations retry briefly locked managed files. If a lock persists, navigation is cancelled without skipping the file and the notification identifies the Git file operation that failed. Pending recovery survives a session or extension reload; edits made after the failed restore are never overwritten automatically and can be preserved with `/checkpoint`.
+
 ## Configuration
 
 Configure via Pi settings:

@@ -3,7 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import {
   AuthStorage,
@@ -252,6 +252,102 @@ async function waitForText(filePath: string, expected: string, message: string):
   }, message);
 }
 
+async function holdWindowsFileWithoutDeleteSharing(
+  filePath: string,
+  tempDir: string,
+  options: {
+    releaseAfterMs?: number;
+    mutateAfterMs?: number;
+    mutateContent?: string;
+  } = {},
+): Promise<() => Promise<void>> {
+  const scriptPath = path.join(tempDir, "hold-file-lock.ps1");
+  const releaseSignalPath = path.join(tempDir, "release-file-lock.signal");
+  await writeFile(scriptPath, [
+    "param([string]$filePath, [string]$releaseMode, [string]$releaseSignalPath, [string]$mutateAfterMs, [string]$mutateContentBase64)",
+    "$access = if ($mutateAfterMs -ne 'none') { [System.IO.FileAccess]::ReadWrite } else { [System.IO.FileAccess]::Read }",
+    "$handle = [System.IO.File]::Open($filePath, [System.IO.FileMode]::Open, $access, [System.IO.FileShare]::ReadWrite)",
+    "[Console]::Out.WriteLine('READY')",
+    "[Console]::Out.Flush()",
+    "if ($mutateAfterMs -ne 'none') {",
+    "  Start-Sleep -Milliseconds ([int]$mutateAfterMs)",
+    "  $content = [Convert]::FromBase64String($mutateContentBase64)",
+    "  $handle.Position = 0",
+    "  $handle.SetLength(0)",
+    "  $handle.Write($content, 0, $content.Length)",
+    "  $handle.Flush()",
+    "}",
+    "if ($releaseMode -eq 'signal') { while (-not (Test-Path -LiteralPath $releaseSignalPath)) { Start-Sleep -Milliseconds 25 } } else { Start-Sleep -Milliseconds ([int]$releaseMode) }",
+    "$handle.Dispose()",
+  ].join("\n"), "utf8");
+
+  const windowsRoot = process.env.SystemRoot ?? process.env.WINDIR ?? "C:\\Windows";
+  const powershellExe = path.join(windowsRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const child = spawn(powershellExe, [
+    "-NoLogo",
+    "-NoProfile",
+    "-File",
+    scriptPath,
+    filePath,
+    options.releaseAfterMs === undefined ? "signal" : String(options.releaseAfterMs),
+    releaseSignalPath,
+    options.mutateAfterMs === undefined ? "none" : String(options.mutateAfterMs),
+    Buffer.from(options.mutateContent ?? "none", "utf8").toString("base64"),
+  ], {
+    stdio: "pipe",
+    windowsHide: true,
+  });
+  let stderr = "";
+  let ready = false;
+  const exited = new Promise<void>((resolve, reject) => {
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.once("error", reject);
+    child.once("exit", (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(`file lock process exited with ${String(code)}: ${stderr}`));
+      }
+    });
+  });
+  void exited.catch(() => undefined);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      let stdout = "";
+      const timeout = setTimeout(() => reject(new Error("timed out waiting for the Windows file lock helper")), 5_000);
+      child.stdout.on("data", (chunk) => {
+        stdout += chunk.toString();
+        if (!ready && stdout.includes("READY")) {
+          ready = true;
+          clearTimeout(timeout);
+          resolve();
+        }
+      });
+      void exited.catch((error) => {
+        if (!ready) {
+          clearTimeout(timeout);
+          reject(error);
+        }
+      });
+    });
+  } catch (error) {
+    if (child.exitCode === null) {
+      child.kill();
+    }
+    await exited.catch(() => undefined);
+    throw error;
+  }
+
+  return async () => {
+    if (child.exitCode === null && options.releaseAfterMs === undefined) {
+      await writeFile(releaseSignalPath, "release\n", "utf8");
+    }
+    await exited;
+  };
+}
+
 function getSessionHistoryDir(session: Awaited<ReturnType<typeof createSession>>, cwd: string): string {
   const workspaceHash = createHash("sha256").update(path.normalize(cwd)).digest("hex").slice(0, 24);
   return path.join(
@@ -267,8 +363,53 @@ function getTurnSnapshotFile(session: Awaited<ReturnType<typeof createSession>>,
   return path.join(getSessionHistoryDir(session, cwd), "turn-snapshots.json");
 }
 
+function getPendingRecoveryFile(session: Awaited<ReturnType<typeof createSession>>, cwd: string): string {
+  return path.join(getSessionHistoryDir(session, cwd), "pending-recovery.json");
+}
+
 function getShadowGitDir(session: Awaited<ReturnType<typeof createSession>>, cwd: string): string {
   return path.join(getSessionHistoryDir(session, cwd), "repo.git");
+}
+
+function shadowGitArgs(
+  session: Awaited<ReturnType<typeof createSession>>,
+  cwd: string,
+  ...args: string[]
+): string[] {
+  return [
+    "-c",
+    "i18n.logOutputEncoding=utf-8",
+    "-c",
+    "core.autocrlf=false",
+    "-c",
+    "core.safecrlf=false",
+    "-c",
+    "core.filemode=false",
+    "-c",
+    "core.quotepath=false",
+    "--git-dir",
+    getShadowGitDir(session, cwd),
+    "--work-tree",
+    cwd,
+    ...args,
+  ];
+}
+
+async function refreshShadowIndex(session: Awaited<ReturnType<typeof createSession>>, cwd: string): Promise<void> {
+  await execFileAsync("git", shadowGitArgs(session, cwd, "add", "-A", "--", "."), { cwd });
+}
+
+async function getShadowStatus(session: Awaited<ReturnType<typeof createSession>>, cwd: string): Promise<string> {
+  const { stdout } = await execFileAsync("git", shadowGitArgs(
+    session,
+    cwd,
+    "status",
+    "--porcelain=v1",
+    "--untracked-files=all",
+    "--",
+    ".",
+  ), { cwd });
+  return stdout;
 }
 
 function getReusableGitDir(session: Awaited<ReturnType<typeof createSession>>, cwd: string): string {
@@ -320,6 +461,32 @@ async function countSnapshots(session: Awaited<ReturnType<typeof createSession>>
       (!kind || (entry as any).data?.kind === kind)
     );
   }).length;
+}
+
+function findBaselineSnapshot(session: Awaited<ReturnType<typeof createSession>>) {
+  return session.sessionManager.getEntries().find((entry) => {
+    if (entry.type !== "custom" || entry.customType !== "workspace-history.snapshot") {
+      return false;
+    }
+    const data: unknown = entry.data;
+    return typeof data === "object" && data !== null && "kind" in data && data.kind === "baseline";
+  });
+}
+
+function captureNotifications(session: Awaited<ReturnType<typeof createSession>>): string[] {
+  const notifications: string[] = [];
+  type UIContext = Parameters<typeof session.extensionRunner.setUIContext>[0];
+  const uiContext = new Proxy({
+    notify(message: string): void {
+      notifications.push(message);
+    },
+  }, {
+    get(target, property) {
+      return Reflect.get(target, property) ?? (() => undefined);
+    },
+  }) as UIContext;
+  session.extensionRunner.setUIContext(uiContext);
+  return notifications;
 }
 
 async function testUndoRedo(): Promise<void> {
@@ -1072,6 +1239,225 @@ async function testRestoreFailureDoesNotDeleteCurrentWorkspace(): Promise<void> 
   }
 }
 
+async function testTreeRestoreWaitsForTransientWindowsFileLock(): Promise<void> {
+  if (process.platform !== "win32") {
+    return;
+  }
+
+  const ctx = await createContext();
+  let releaseLock: (() => Promise<void>) | undefined;
+  try {
+    const session = await createSession(ctx);
+    const filePath = path.join(ctx.cwd, "transient-lock.txt");
+
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "transient-lock.txt", content: "locked briefly\n" })]),
+      fauxAssistantMessage("created transient lock file"),
+    ]);
+    await session.prompt("create transient-lock.txt");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "transient lock after snapshot was not created");
+
+    const baseline = findBaselineSnapshot(session);
+    assert.ok(baseline, "baseline snapshot should exist for transient lock test");
+    const notifications = captureNotifications(session);
+
+    releaseLock = await holdWindowsFileWithoutDeleteSharing(filePath, ctx.rootDir, { releaseAfterMs: 500 });
+    await refreshShadowIndex(session, ctx.cwd);
+    assert.equal(await getShadowStatus(session, ctx.cwd), "", "file lock test must start from a clean workspace");
+    const nav = await session.navigateTree(baseline!.id, { summarize: false });
+
+    assert.equal(nav.cancelled, false, `tree navigation should wait for a transient Windows file lock: ${notifications.join(" | ")}`);
+    assert.equal(session.sessionManager.getLeafId(), baseline!.id, "tree navigation should reach the selected history node");
+    await waitForExists(filePath, false, "target snapshot should be restored after the transient lock is released");
+    session.dispose();
+  } finally {
+    await releaseLock?.();
+    await disposeContext(ctx);
+  }
+}
+
+async function testTreeRestoreRetriesLockedWindowsFileReplacement(): Promise<void> {
+  if (process.platform !== "win32") {
+    return;
+  }
+
+  const ctx = await createContext();
+  let releaseLock: (() => Promise<void>) | undefined;
+  try {
+    const filePath = path.join(ctx.cwd, "replace-lock.txt");
+    await writeFile(filePath, "before\n", "utf8");
+    const session = await createSession(ctx);
+
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "replace-lock.txt", content: "after\n" })]),
+      fauxAssistantMessage("updated replace lock file"),
+    ]);
+    await session.prompt("update replace-lock.txt");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "replacement lock after snapshot was not created");
+
+    const baseline = findBaselineSnapshot(session);
+    assert.ok(baseline, "baseline snapshot should exist for replacement lock test");
+
+    releaseLock = await holdWindowsFileWithoutDeleteSharing(filePath, ctx.rootDir, { releaseAfterMs: 500 });
+    await refreshShadowIndex(session, ctx.cwd);
+    const nav = await session.navigateTree(baseline!.id, { summarize: false });
+
+    assert.equal(nav.cancelled, false, "tree navigation should retry replacing a briefly locked Windows file");
+    assert.equal(session.sessionManager.getLeafId(), baseline!.id, "replacement retry should reach the selected history node");
+    await waitForText(filePath, "before\n", "replacement retry should restore the target file contents");
+    session.dispose();
+  } finally {
+    await releaseLock?.();
+    await disposeContext(ctx);
+  }
+}
+
+async function testPersistentWindowsFileLockReportsCauseAndCanBeRetried(): Promise<void> {
+  if (process.platform !== "win32") {
+    return;
+  }
+
+  const ctx = await createContext();
+  let resumedCtx: TestContext | undefined;
+  let releaseLock: (() => Promise<void>) | undefined;
+  try {
+    const companionPath = path.join(ctx.cwd, "z-companion.txt");
+    await writeFile(companionPath, "before\n", "utf8");
+    let session = await createSession(ctx);
+    const filePath = path.join(ctx.cwd, "persistent-lock.txt");
+
+    ctx.provider.setResponses([
+      fauxAssistantMessage([
+        fauxToolCall("write", { path: "persistent-lock.txt", content: "still locked\n" }),
+        fauxToolCall("write", { path: "z-companion.txt", content: "after\n" }),
+      ]),
+      fauxAssistantMessage("updated files for persistent lock test"),
+    ]);
+    await session.prompt("update files for persistent lock test");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "persistent lock after snapshot was not created");
+
+    const baseline = findBaselineSnapshot(session);
+    assert.ok(baseline, "baseline snapshot should exist for persistent lock test");
+    const turnSnapshot = (await readTurnSnapshots(session, ctx.cwd)).turns[0];
+    assert.ok(turnSnapshot, "turn snapshot should exist for persistent lock test");
+
+    const notifications = captureNotifications(session);
+
+    releaseLock = await holdWindowsFileWithoutDeleteSharing(filePath, ctx.rootDir, {
+      mutateAfterMs: 700,
+      mutateContent: "changed while locked\n",
+    });
+    await refreshShadowIndex(session, ctx.cwd);
+    const originalLeaf = session.sessionManager.getLeafId();
+    await session.prompt("/undo");
+
+    assert.equal(session.sessionManager.getLeafId(), originalLeaf, "cancelled undo should keep the current history node");
+    assert.equal(normalizeEol(await readText(filePath)), "changed while locked\n", "persistent lock should not be skipped during restore");
+    assert.equal(normalizeEol(await readText(companionPath)), "after\n", "failed rollback should realign the companion file to the current snapshot");
+    const failureNotification = notifications.find((message) => /unable to unlink|failed to remove/i.test(message));
+    assert.ok(failureNotification?.includes("persistent-lock.txt"), "restore failure should identify the locked file and preserve the real Git error");
+    assert.doesNotMatch(failureNotification, /--git-dir|repo\.git/i, "restore failure should not expose internal shadow repository paths");
+    assert.equal(notifications.includes("Undo cancelled."), false, "undo should not replace the actionable restore error with a generic notification");
+
+    const { stdout: shadowHead } = await execFileAsync("git", shadowGitArgs(session, ctx.cwd, "rev-parse", "HEAD"), { cwd: ctx.cwd });
+    assert.equal(shadowHead.trim(), turnSnapshot.afterCommit, "failed rollback should realign the shadow HEAD to the current snapshot");
+    await execFileAsync("git", shadowGitArgs(
+      session,
+      ctx.cwd,
+      "diff",
+      "--cached",
+      "--quiet",
+      turnSnapshot.afterCommit,
+      "--",
+      ".",
+    ), { cwd: ctx.cwd });
+    assert.equal(await pathExists(getPendingRecoveryFile(session, ctx.cwd)), true, "failed rollback should persist its recovery state");
+
+    const sessionManager = session.sessionManager;
+    session.dispose();
+    resumedCtx = await createContextForWorkspace(ctx.rootDir, ctx.cwd);
+    session = await createSession(resumedCtx, sessionManager);
+
+    await releaseLock();
+    releaseLock = undefined;
+    await session.prompt("/undo");
+
+    assert.equal(session.sessionManager.getLeafId(), baseline!.id, "undo should be retryable after the persistent lock is released");
+    await waitForExists(filePath, false, "retry should restore the target snapshot without skipping the formerly locked file");
+    await waitForText(companionPath, "before\n", "retry should restore every file in the target snapshot");
+    assert.equal(await pathExists(getPendingRecoveryFile(session, ctx.cwd)), false, "successful recovery should clear the persisted recovery state");
+    session.dispose();
+  } finally {
+    resumedCtx?.provider.unregister();
+    await releaseLock?.();
+    await disposeContext(ctx);
+  }
+}
+
+async function testPendingRecoveryPreservesLaterManualEdits(): Promise<void> {
+  if (process.platform !== "win32") {
+    return;
+  }
+
+  const ctx = await createContext();
+  let releaseLock: (() => Promise<void>) | undefined;
+  try {
+    const companionPath = path.join(ctx.cwd, "z-recovery-companion.txt");
+    const lockedPath = path.join(ctx.cwd, "recovery-guard-lock.txt");
+    const manualPath = path.join(ctx.cwd, "manual-after-failure.txt");
+    await writeFile(companionPath, "before\n", "utf8");
+    const session = await createSession(ctx);
+
+    ctx.provider.setResponses([
+      fauxAssistantMessage([
+        fauxToolCall("write", { path: "recovery-guard-lock.txt", content: "current\n" }),
+        fauxToolCall("write", { path: "z-recovery-companion.txt", content: "after\n" }),
+      ]),
+      fauxAssistantMessage("updated files for recovery guard test"),
+    ]);
+    await session.prompt("update files for recovery guard test");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "recovery guard after snapshot was not created");
+
+    const baseline = findBaselineSnapshot(session);
+    assert.ok(baseline, "baseline snapshot should exist for recovery guard test");
+    const notifications = captureNotifications(session);
+    releaseLock = await holdWindowsFileWithoutDeleteSharing(lockedPath, ctx.rootDir, {
+      mutateAfterMs: 700,
+      mutateContent: "changed while locked\n",
+    });
+    await refreshShadowIndex(session, ctx.cwd);
+    const originalLeaf = session.sessionManager.getLeafId();
+    await session.prompt("/undo");
+    assert.equal(session.sessionManager.getLeafId(), originalLeaf, "persistent lock should cancel the first undo");
+
+    await writeFile(manualPath, "preserve me\n", "utf8");
+    await releaseLock();
+    releaseLock = undefined;
+    notifications.length = 0;
+    await session.prompt("/undo");
+
+    assert.equal(session.sessionManager.getLeafId(), originalLeaf, "later manual edits should block automatic pending recovery");
+    await waitForText(manualPath, "preserve me\n", "pending recovery must not overwrite later manual edits");
+    assert.ok(
+      notifications.some((message) => message.includes("Run /checkpoint")),
+      "blocked recovery should direct the user to checkpoint later edits",
+    );
+
+    await session.prompt("/checkpoint keep recovery edits");
+    await waitForText(manualPath, "preserve me\n", "checkpoint should preserve edits made after the failed restore");
+    assert.equal(await pathExists(getPendingRecoveryFile(session, ctx.cwd)), false, "checkpoint should clear obsolete recovery state");
+
+    await session.prompt("/undo");
+    assert.equal(session.sessionManager.getLeafId(), baseline!.id, "undo should work after preserving later edits with a checkpoint");
+    await waitForExists(lockedPath, false, "undo should restore the target snapshot after checkpointing later edits");
+    await waitForText(companionPath, "before\n", "undo should restore the companion file after checkpointing later edits");
+    session.dispose();
+  } finally {
+    await releaseLock?.();
+    await disposeContext(ctx);
+  }
+}
+
 async function testBranchSnapshotsSurviveGitPrune(): Promise<void> {
   const ctx = await createContext();
   try {
@@ -1266,6 +1652,10 @@ async function main(): Promise<void> {
     { name: "undo and redo block on unsnapshotted manual changes", run: testUndoAndRedoBlockOnUnsnapshottedManualChanges },
     { name: ".gitignore stops managing ignored paths", run: testGitignoreStopsManagingIgnoredPaths },
     { name: "restore failure does not delete current workspace", run: testRestoreFailureDoesNotDeleteCurrentWorkspace },
+    { name: "tree restore waits for a transient Windows file lock", run: testTreeRestoreWaitsForTransientWindowsFileLock },
+    { name: "tree restore retries locked Windows file replacement", run: testTreeRestoreRetriesLockedWindowsFileReplacement },
+    { name: "persistent Windows file lock reports cause and can be retried", run: testPersistentWindowsFileLockReportsCauseAndCanBeRetried },
+    { name: "pending recovery preserves later manual edits", run: testPendingRecoveryPreservesLaterManualEdits },
   ];
 
   for (const test of tests) {
