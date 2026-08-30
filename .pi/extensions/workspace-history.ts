@@ -12,6 +12,7 @@ import {
   mkdir,
   readFile,
   realpath,
+  rename,
   stat,
   unlink,
   writeFile,
@@ -132,6 +133,10 @@ interface RuntimeState {
   lastIndexPruneIgnoreSource?: string;
   lastExcludedWorkspacePaths?: string[];
   initializationNoticeShown?: boolean;
+  invalidShadowRepoNoticeShown?: boolean;
+  invalidShadowRepoRecoveryPending?: boolean;
+  reusableRepoFailureNoticeShown?: boolean;
+  validatedShadowGitDir?: string;
   warnedMissingSnapshotCommits?: Set<string>;
 }
 
@@ -560,12 +565,77 @@ async function listSubdirectories(dirPath: string): Promise<string[]> {
   }
 }
 
-async function findReusableShadowGitDir(ctx: ExtensionContext, state?: RuntimeState): Promise<{ gitDir: string; shared: boolean } | undefined> {
+async function isBareShadowGitDir(pi: ExtensionAPI, ctx: ExtensionContext, gitDir: string, state?: RuntimeState): Promise<boolean> {
+  const result = await withTimeout(
+    pi.exec("git", ["--git-dir", gitDir, "rev-parse", "--is-bare-repository"], { cwd: ctx.cwd }),
+    await getGitTimeoutMs(ctx, state),
+    "git shadow repo validation",
+  );
+  return result.code === 0 && result.stdout.trim() === "true";
+}
+
+async function isReusableShadowGitDir(pi: ExtensionAPI, ctx: ExtensionContext, gitDir: string, state?: RuntimeState): Promise<boolean> {
+  if (!await isBareShadowGitDir(pi, ctx, gitDir, state)) {
+    return false;
+  }
+  const result = await withTimeout(
+    pi.exec("git", ["--git-dir", gitDir, "rev-parse", "--verify", "--quiet", "HEAD^{commit}"], { cwd: ctx.cwd }),
+    await getGitTimeoutMs(ctx, state),
+    "git reusable shadow repo validation",
+  );
+  return result.code === 0;
+}
+
+function clearShadowRepoRuntimeCaches(state?: RuntimeState): void {
+  if (!state) {
+    return;
+  }
+  state.validatedShadowGitDir = undefined;
+  state.lastKnownShadowHead = undefined;
+  state.initialSnapshotCommit = undefined;
+  state.warmedBaselineCommit = undefined;
+  state.cachedExcludeSource = undefined;
+  state.lastIndexPruneIgnoreSource = undefined;
+  state.lastExcludedWorkspacePaths = undefined;
+  state.warnedMissingSnapshotCommits = undefined;
+}
+
+async function quarantineInvalidShadowGitDir(ctx: ExtensionContext, gitDir: string, state?: RuntimeState): Promise<string> {
+  const quarantineDir = `${gitDir}.invalid-${Date.now()}-${randomUUID()}`;
+  try {
+    await rename(gitDir, quarantineDir);
+  } catch (error) {
+    throw new Error(`Unable to preserve invalid shadow repository at ${gitDir}: ${String(error)}`, { cause: error });
+  }
+  await logLine(ctx, `quarantine invalid repo from=${gitDir} to=${quarantineDir}`, state);
+  return quarantineDir;
+}
+
+function notifyInvalidShadowRepoRecovery(ctx: ExtensionContext, state: RuntimeState | undefined, recoveredInCurrentCall: boolean): void {
+  if (!recoveredInCurrentCall && !state?.invalidShadowRepoRecoveryPending) {
+    return;
+  }
+  if (!state?.invalidShadowRepoNoticeShown) {
+    ctx.ui.notify(
+      "Workspace history found an invalid snapshot repository and rebuilt it. Older snapshots from this session may be unavailable.",
+      "warning",
+    );
+  }
+  if (state) {
+    state.invalidShadowRepoNoticeShown = true;
+    state.invalidShadowRepoRecoveryPending = false;
+  }
+}
+
+async function findReusableShadowGitDir(pi: ExtensionAPI, ctx: ExtensionContext, state?: RuntimeState): Promise<{ gitDir: string; shared: boolean } | undefined> {
   const paths = await ensureStorageDirs(ctx, state);
   const currentSessionId = ctx.sessionManager.getSessionId();
   if (await exists(paths.reusableGitDir) && !await exists(path.join(paths.reusableGitDir, "index.lock"))) {
-    await logLine(ctx, `reuse workspace repo candidate gitDir=${paths.reusableGitDir}`, state);
-    return { gitDir: paths.reusableGitDir, shared: true };
+    if (await isReusableShadowGitDir(pi, ctx, paths.reusableGitDir, state)) {
+      await logLine(ctx, `reuse workspace repo candidate gitDir=${paths.reusableGitDir}`, state);
+      return { gitDir: paths.reusableGitDir, shared: true };
+    }
+    await quarantineInvalidShadowGitDir(ctx, paths.reusableGitDir, state);
   }
 
   const sessionIds = await listSubdirectories(paths.sessionsRoot);
@@ -585,6 +655,10 @@ async function findReusableShadowGitDir(ctx: ExtensionContext, state?: RuntimeSt
     if (!await exists(candidate.gitDir) || await exists(path.join(candidate.gitDir, "index.lock"))) {
       continue;
     }
+    if (!await isReusableShadowGitDir(pi, ctx, candidate.gitDir, state)) {
+      await logLine(ctx, `skip invalid session repo candidate gitDir=${candidate.gitDir}`, state);
+      continue;
+    }
     await logLine(ctx, `reuse session repo candidate gitDir=${candidate.gitDir}`, state);
     return { gitDir: candidate.gitDir, shared: false };
   }
@@ -597,6 +671,10 @@ async function updateReusableShadowRepo(pi: ExtensionAPI, ctx: ExtensionContext,
   const paths = await ensureStorageDirs(ctx, state);
   if (!await exists(paths.shadowGitDir) || await exists(path.join(paths.shadowGitDir, "index.lock"))) {
     return;
+  }
+
+  if (await exists(paths.reusableGitDir) && !await isReusableShadowGitDir(pi, ctx, paths.reusableGitDir, state)) {
+    await quarantineInvalidShadowGitDir(ctx, paths.reusableGitDir, state);
   }
 
   if (!await exists(paths.reusableGitDir)) {
@@ -618,6 +696,17 @@ function scheduleReusableShadowRepoUpdate(pi: ExtensionAPI, ctx: ExtensionContex
     await updateReusableShadowRepo(pi, ctx, state);
   }).catch((error) => {
     void logLine(ctx, `update reusable repo failed error=${String(error)}`, state);
+    if (!state.reusableRepoFailureNoticeShown) {
+      try {
+        ctx.ui.notify(
+          `Workspace history could not refresh its reusable snapshot repository: ${String(error)} Session snapshots remain available.`,
+          "warning",
+        );
+      } catch {
+        // The originating extension context may have been replaced before this background update settled.
+      }
+      state.reusableRepoFailureNoticeShown = true;
+    }
   }).finally(() => {
     state.reusableRepoUpdatePromise = undefined;
   });
@@ -868,8 +957,7 @@ async function execGit(pi: ExtensionAPI, ctx: ExtensionContext, args: string[]):
   return result.stdout.trim();
 }
 
-async function gitArgs(ctx: ExtensionContext, state: RuntimeState | undefined, ...args: string[]): Promise<string[]> {
-  const paths = await getWorkspaceStoragePaths(ctx, state);
+function gitArgsForShadowGitDir(ctx: ExtensionContext, gitDir: string, ...args: string[]): string[] {
   return [
     "-c",
     "i18n.logOutputEncoding=utf-8",
@@ -882,11 +970,16 @@ async function gitArgs(ctx: ExtensionContext, state: RuntimeState | undefined, .
     "-c",
     "core.quotepath=false",
     "--git-dir",
-    paths.shadowGitDir,
+    gitDir,
     "--work-tree",
     ctx.cwd,
     ...args,
   ];
+}
+
+async function gitArgs(ctx: ExtensionContext, state: RuntimeState | undefined, ...args: string[]): Promise<string[]> {
+  const paths = await getWorkspaceStoragePaths(ctx, state);
+  return gitArgsForShadowGitDir(ctx, paths.shadowGitDir, ...args);
 }
 
 async function gitCommitArgs(ctx: ExtensionContext, state: RuntimeState | undefined, ...args: string[]): Promise<string[]> {
@@ -1003,34 +1096,83 @@ async function getHeadCommit(pi: ExtensionAPI, ctx: ExtensionContext, state?: Ru
   return result.code === 0 ? result.stdout.trim() : undefined;
 }
 
+async function buildShadowGitDir(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  targetGitDir: string,
+  reusableGitDir: { gitDir: string; shared: boolean } | undefined,
+  state?: RuntimeState,
+): Promise<void> {
+  const buildGitDir = path.join(path.dirname(targetGitDir), `.wh-${randomUUID().slice(0, 8)}`);
+  try {
+    if (reusableGitDir) {
+      await execGit(pi, ctx, [
+        "clone",
+        ...(reusableGitDir.shared ? ["--shared"] : ["--no-local"]),
+        "--bare",
+        "--single-branch",
+        "--no-tags",
+        reusableGitDir.gitDir,
+        buildGitDir,
+      ]);
+      await execGit(pi, ctx, gitArgsForShadowGitDir(ctx, buildGitDir, "read-tree", "HEAD"));
+    } else {
+      await execGit(pi, ctx, ["init", "--bare", buildGitDir]);
+    }
+    if (!await isBareShadowGitDir(pi, ctx, buildGitDir, state)) {
+      throw new Error(`Git did not create a valid bare repository at ${buildGitDir}.`);
+    }
+    await rename(buildGitDir, targetGitDir);
+  } catch (error) {
+    throw new Error(
+      `Unable to rebuild shadow repository at ${targetGitDir}: ${String(error)} Any partial repository remains at ${buildGitDir}.`,
+      { cause: error },
+    );
+  }
+}
+
 async function ensureShadowRepo(pi: ExtensionAPI, ctx: ExtensionContext, state?: RuntimeState): Promise<void> {
   const startedAt = Date.now();
   await assertWorkspaceHistoryEnabled(ctx, state, "ensureShadowRepo");
   const paths = await ensureStorageDirs(ctx, state);
-  if (await exists(paths.shadowGitDir)) {
+  if (state?.validatedShadowGitDir === paths.shadowGitDir) {
     await syncShadowRepoExclude(ctx, state);
-    await logLine(ctx, `ensure shadow repo existing done ${elapsedMs(startedAt)}ms`, state);
+    notifyInvalidShadowRepoRecovery(ctx, state, false);
+    await logLine(ctx, `ensure shadow repo cached done ${elapsedMs(startedAt)}ms`, state);
     return;
   }
 
-  const reusableGitDir = await findReusableShadowGitDir(ctx, state);
+  let rebuiltInvalidRepo = false;
+  if (await exists(paths.shadowGitDir)) {
+    if (await isBareShadowGitDir(pi, ctx, paths.shadowGitDir, state)) {
+      if (state) {
+        state.validatedShadowGitDir = paths.shadowGitDir;
+      }
+      await syncShadowRepoExclude(ctx, state);
+      notifyInvalidShadowRepoRecovery(ctx, state, false);
+      await logLine(ctx, `ensure shadow repo existing done ${elapsedMs(startedAt)}ms`, state);
+      return;
+    }
+    await quarantineInvalidShadowGitDir(ctx, paths.shadowGitDir, state);
+    clearShadowRepoRuntimeCaches(state);
+    if (state) {
+      state.invalidShadowRepoRecoveryPending = true;
+    }
+    rebuiltInvalidRepo = true;
+  }
+
+  const reusableGitDir = await findReusableShadowGitDir(pi, ctx, state);
+  await buildShadowGitDir(pi, ctx, paths.shadowGitDir, reusableGitDir, state);
   if (reusableGitDir) {
-    await execGit(pi, ctx, [
-      "clone",
-      ...(reusableGitDir.shared ? ["--shared"] : ["--no-local"]),
-      "--bare",
-      "--single-branch",
-      "--no-tags",
-      reusableGitDir.gitDir,
-      paths.shadowGitDir,
-    ]);
-    await execGit(pi, ctx, await gitArgs(ctx, state, "read-tree", "HEAD"));
     await logLine(ctx, `clone repo session=${ctx.sessionManager.getSessionId()} shared=${String(reusableGitDir.shared)} from=${reusableGitDir.gitDir} gitDir=${paths.shadowGitDir}`, state);
   } else {
-    await execGit(pi, ctx, ["init", "--bare", paths.shadowGitDir]);
     await logLine(ctx, `init repo session=${ctx.sessionManager.getSessionId()} gitDir=${paths.shadowGitDir}`, state);
   }
+  if (state) {
+    state.validatedShadowGitDir = paths.shadowGitDir;
+  }
   await syncShadowRepoExclude(ctx, state);
+  notifyInvalidShadowRepoRecovery(ctx, state, rebuiltInvalidRepo);
   await logLine(ctx, `ensure shadow repo created done ${elapsedMs(startedAt)}ms`, state);
 }
 
@@ -2268,6 +2410,10 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     state.reusableRepoUpdatePromise = undefined;
     state.disabledNoticeReason = undefined;
     state.initializationNoticeShown = false;
+    state.invalidShadowRepoNoticeShown = false;
+    state.invalidShadowRepoRecoveryPending = false;
+    state.reusableRepoFailureNoticeShown = false;
+    state.validatedShadowGitDir = undefined;
     state.warnedMissingSnapshotCommits = undefined;
 
     if (!await ensureWorkspaceHistoryAvailable(ctx, state, "session_start")) {

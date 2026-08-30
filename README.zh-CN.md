@@ -122,6 +122,8 @@
 
 在 Windows 上，恢复操作会重试短暂锁定的纳管文件。如果文件持续被占用，导航会取消而不会跳过该文件，并在提示中指出失败的 Git 文件操作。待恢复状态可跨会话或扩展重载保留；恢复失败后产生的新编辑不会被自动覆盖，可先用 `/checkpoint` 保留。
 
+插件会在使用前校验当前 session 的 shadow repo。如果当前 session repo 或工作区 reusable repo 无效，插件会先将其原样保留为同级的 `repo.git.invalid-<timestamp>-<uuid>`，再自动重建可用仓库，后续快照可继续正常工作；但仅存在于无效仓库中的旧快照可能不可用。其他 session 的无效仓库只会被跳过，不会被修改。
+
 ## 配置
 
 通过 Pi 的 settings 配置：
@@ -241,6 +243,7 @@ npm run typecheck
 说明：
 
 - shadow git 与用户项目自身的 `.git` 历史隔离
+- 自动恢复时，无效的 shadow repo 会保留为 `repo.git.invalid-<timestamp>-<uuid>`
 - 旧的工作区内 `.pi/workspace-history/` 状态不会自动迁移
 - 清理策略基于最近使用时间（LRU 风格）
 - 在 `auto` 模式下，插件会在像用户 home 目录这样的宽泛目录里自动禁用，避免启动扫描过大导致卡顿

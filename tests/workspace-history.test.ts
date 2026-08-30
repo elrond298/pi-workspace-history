@@ -1,4 +1,4 @@
-import { access, mkdtemp, mkdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import { access, copyFile, mkdtemp, mkdir, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import assert from "node:assert/strict";
@@ -410,6 +410,13 @@ async function getShadowStatus(session: Awaited<ReturnType<typeof createSession>
     ".",
   ), { cwd });
   return stdout;
+}
+
+async function assertValidShadowRepo(gitDir: string, cwd: string, description: string): Promise<void> {
+  const bareResult = await execFileAsync("git", ["--git-dir", gitDir, "rev-parse", "--is-bare-repository"], { cwd });
+  assert.equal(bareResult.stdout.trim(), "true", `${description} should be bare`);
+  const headResult = await execFileAsync("git", ["--git-dir", gitDir, "rev-parse", "--verify", "HEAD^{commit}"], { cwd });
+  assert.match(headResult.stdout.trim(), /^[0-9a-f]{40,64}$/i, `${description} should have a resolvable HEAD commit`);
 }
 
 function getReusableGitDir(session: Awaited<ReturnType<typeof createSession>>, cwd: string): string {
@@ -1060,6 +1067,192 @@ async function testNewSessionReusesWorkspaceShadowRepo(): Promise<void> {
   }
 }
 
+async function testInvalidCurrentShadowRepoIsQuarantinedAndRebuilt(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    const session = await createSession(ctx);
+    const sessionRoot = getSessionHistoryDir(session, ctx.cwd);
+    const gitDir = getShadowGitDir(session, ctx.cwd);
+    const markerFile = "recoverable-marker.txt";
+    await mkdir(gitDir, { recursive: true });
+    await writeFile(path.join(gitDir, markerFile), "keep this data\n", "utf8");
+    const notifications = captureNotifications(session);
+
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "recovered-first.txt", content: "first\n" })]),
+      fauxAssistantMessage("created first recovery file"),
+      fauxAssistantMessage([fauxToolCall("write", { path: "recovered-second.txt", content: "second\n" })]),
+      fauxAssistantMessage("created second recovery file"),
+    ]);
+
+    await session.prompt("create first recovery file");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "first snapshot was not created after shadow repo recovery");
+    await session.prompt("create second recovery file");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 2, "second snapshot was not created after shadow repo recovery");
+    assert.equal(normalizeEol(await readFile(path.join(ctx.cwd, "recovered-first.txt"), "utf8")), "first\n");
+    assert.equal(normalizeEol(await readFile(path.join(ctx.cwd, "recovered-second.txt"), "utf8")), "second\n");
+
+    const quarantinedDirs = (await readdir(sessionRoot, { withFileTypes: true }))
+      .filter((entry) => entry.isDirectory() && entry.name.startsWith("repo.git.invalid-"));
+    assert.equal(quarantinedDirs.length, 1, "invalid current repo should be quarantined once");
+    assert.equal(
+      await readFile(path.join(sessionRoot, quarantinedDirs[0]!.name, markerFile), "utf8"),
+      "keep this data\n",
+      "quarantining an invalid repo should preserve its data",
+    );
+
+    await assertValidShadowRepo(gitDir, ctx.cwd, "rebuilt shadow repo");
+    assert.equal(
+      notifications.filter((message) => /invalid.*rebuilt/i.test(message)).length,
+      1,
+      "automatic recovery should notify the user once",
+    );
+
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
+async function testInvalidReusableShadowRepoIsQuarantinedAndRebuilt(): Promise<void> {
+  const ctx1 = await createContext();
+  try {
+    const session1 = await createSession(ctx1);
+    ctx1.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "reusable-source.txt", content: "source\n" })]),
+      fauxAssistantMessage("created reusable source"),
+    ]);
+    await session1.prompt("create reusable source");
+    await waitFor(async () => await countSnapshots(session1, ctx1.cwd, "after") >= 1, "source session snapshot was not created");
+
+    const sourceGitDir = getShadowGitDir(session1, ctx1.cwd);
+    const reusableGitDir = getReusableGitDir(session1, ctx1.cwd);
+    await waitFor(async () => {
+      try {
+        const result = await execFileAsync("git", ["--git-dir", reusableGitDir, "rev-parse", "--verify", "HEAD^{commit}"], { cwd: ctx1.cwd });
+        return /^[0-9a-f]{40,64}$/i.test(result.stdout.trim());
+      } catch {
+        return false;
+      }
+    }, "workspace reusable repo was not created", 10000);
+    session1.dispose();
+
+    const markerFile = "reusable-marker.txt";
+    await rm(reusableGitDir, { recursive: true, force: true });
+    await mkdir(reusableGitDir, { recursive: true });
+    await writeFile(path.join(reusableGitDir, markerFile), "preserve reusable data\n", "utf8");
+
+    const ctx2 = await createContextForWorkspace(ctx1.rootDir, ctx1.cwd);
+    try {
+      const session2 = await createSession(ctx2);
+      ctx2.provider.setResponses([
+        fauxAssistantMessage([fauxToolCall("write", { path: "reusable-recovered.txt", content: "recovered\n" })]),
+        fauxAssistantMessage("created after reusable recovery"),
+      ]);
+      await session2.prompt("create after reusable recovery");
+      await waitFor(async () => await countSnapshots(session2, ctx2.cwd, "after") >= 1, "snapshot was not created after reusable repo recovery");
+      assert.equal(normalizeEol(await readFile(path.join(ctx2.cwd, "reusable-recovered.txt"), "utf8")), "recovered\n");
+
+      const reusableRoot = path.dirname(reusableGitDir);
+      const quarantinedDirs = (await readdir(reusableRoot, { withFileTypes: true }))
+        .filter((entry) => entry.isDirectory() && entry.name.startsWith("repo.git.invalid-"));
+      assert.equal(quarantinedDirs.length, 1, "invalid reusable repo should be quarantined once");
+      assert.equal(
+        await readFile(path.join(reusableRoot, quarantinedDirs[0]!.name, markerFile), "utf8"),
+        "preserve reusable data\n",
+        "quarantining the reusable repo should preserve its data",
+      );
+      assert.equal(await pathExists(path.join(sourceGitDir, "HEAD")), true, "recovery should not modify the source session repo");
+
+      const session2GitDir = getShadowGitDir(session2, ctx2.cwd);
+      await assertValidShadowRepo(session2GitDir, ctx2.cwd, "new session shadow repo");
+
+      session2.dispose();
+    } finally {
+      ctx2.provider.unregister();
+    }
+  } finally {
+    await disposeContext(ctx1);
+  }
+}
+
+async function testFailedShadowRepoRebuildDoesNotLeaveCanonicalRepo(): Promise<void> {
+  const ctx1 = await createContext();
+  try {
+    const session1 = await createSession(ctx1);
+    ctx1.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "rebuild-source.txt", content: "source\n" })]),
+      fauxAssistantMessage("created rebuild source"),
+    ]);
+    await session1.prompt("create rebuild source");
+    await waitFor(async () => await countSnapshots(session1, ctx1.cwd, "after") >= 1, "rebuild source snapshot was not created");
+
+    const sourceGitDir = getShadowGitDir(session1, ctx1.cwd);
+    const reusableGitDir = getReusableGitDir(session1, ctx1.cwd);
+    await waitFor(async () => await pathExists(path.join(reusableGitDir, "HEAD")), "reusable repo was not created", 10000);
+    session1.dispose();
+
+    const headResult = await execFileAsync("git", ["--git-dir", sourceGitDir, "rev-parse", "--verify", "HEAD^{commit}"], { cwd: ctx1.cwd });
+    const headCommit = headResult.stdout.trim();
+    const sourceCommitObject = path.join(sourceGitDir, "objects", headCommit.slice(0, 2), headCommit.slice(2));
+    assert.equal(await pathExists(sourceCommitObject), true, "source commit should be loose for the corrupt repo fixture");
+
+    await rm(reusableGitDir, { recursive: true, force: true });
+    await execFileAsync("git", ["init", "--bare", reusableGitDir], { cwd: ctx1.cwd });
+    await execFileAsync("git", ["--git-dir", reusableGitDir, "symbolic-ref", "HEAD", "refs/heads/main"], { cwd: ctx1.cwd });
+    await mkdir(path.join(reusableGitDir, "refs", "heads"), { recursive: true });
+    await writeFile(path.join(reusableGitDir, "refs", "heads", "main"), `${headCommit}\n`, "utf8");
+    const corruptCommitObject = path.join(reusableGitDir, "objects", headCommit.slice(0, 2), headCommit.slice(2));
+    await mkdir(path.dirname(corruptCommitObject), { recursive: true });
+    await copyFile(sourceCommitObject, corruptCommitObject);
+
+    const reusableHead = await execFileAsync("git", ["--git-dir", reusableGitDir, "rev-parse", "--verify", "HEAD^{commit}"], { cwd: ctx1.cwd });
+    assert.equal(reusableHead.stdout.trim(), headCommit, "corrupt fixture should pass lightweight reusable HEAD validation");
+
+    const ctx2 = await createContextForWorkspace(ctx1.rootDir, ctx1.cwd);
+    try {
+      const session2 = await createSession(ctx2);
+      const sessionRoot = getSessionHistoryDir(session2, ctx2.cwd);
+      const session2GitDir = getShadowGitDir(session2, ctx2.cwd);
+      await mkdir(session2GitDir, { recursive: true });
+      await writeFile(path.join(session2GitDir, "failure-marker.txt"), "preserve failed recovery data\n", "utf8");
+      const notifications = captureNotifications(session2);
+      ctx2.provider.setResponses([
+        fauxAssistantMessage([fauxToolCall("write", { path: "rebuild-retried.txt", content: "retried\n" })]),
+        fauxAssistantMessage("created after rebuild retry"),
+      ]);
+
+      await assert.rejects(
+        session2.prompt("create after rebuild retry"),
+        /Unable to rebuild shadow repository[\s\S]*(?:tree|object)/i,
+        "a corrupt reusable source should surface the Git rebuild failure",
+      );
+      assert.equal(await pathExists(session2GitDir), false, "failed rebuild should not leave a repo at the canonical path");
+      const failedBuildDirs = (await readdir(sessionRoot, { withFileTypes: true }))
+        .filter((entry) => entry.isDirectory() && entry.name.startsWith(".wh-"));
+      assert.equal(failedBuildDirs.length, 1, "failed rebuild should preserve its partial repo separately");
+      assert.equal(notifications.some((message) => /invalid.*rebuilt/i.test(message)), false, "failed rebuild should not claim recovery succeeded");
+
+      await rm(reusableGitDir, { recursive: true, force: true });
+      await session2.prompt("create after rebuild retry");
+      await waitFor(async () => await countSnapshots(session2, ctx2.cwd, "after") >= 1, "snapshot was not created after retrying shadow repo recovery");
+      assert.equal(normalizeEol(await readFile(path.join(ctx2.cwd, "rebuild-retried.txt"), "utf8")), "retried\n");
+      await assertValidShadowRepo(session2GitDir, ctx2.cwd, "retried shadow repo");
+      assert.equal(
+        notifications.filter((message) => /invalid.*rebuilt/i.test(message)).length,
+        1,
+        "successful retry should report the earlier invalid repo recovery once",
+      );
+
+      session2.dispose();
+    } finally {
+      ctx2.provider.unregister();
+    }
+  } finally {
+    await disposeContext(ctx1);
+  }
+}
+
 async function testStaleShadowRepoLockIsRecovered(): Promise<void> {
   const ctx = await createContext();
   try {
@@ -1647,6 +1840,9 @@ async function main(): Promise<void> {
     { name: ".pi files are managed except internal state", run: testPiFilesAreSnapshotManagedExceptInternalState },
     { name: "history is stored outside workspace", run: testHistoryIsStoredOutsideWorkspace },
     { name: "new session reuses workspace shadow repo", run: testNewSessionReusesWorkspaceShadowRepo },
+    { name: "invalid current shadow repo is quarantined and rebuilt", run: testInvalidCurrentShadowRepoIsQuarantinedAndRebuilt },
+    { name: "invalid reusable shadow repo is quarantined and rebuilt", run: testInvalidReusableShadowRepoIsQuarantinedAndRebuilt },
+    { name: "failed shadow repo rebuild does not leave canonical repo", run: testFailedShadowRepoRebuildDoesNotLeaveCanonicalRepo },
     { name: "stale shadow repo lock is recovered", run: testStaleShadowRepoLockIsRecovered },
     { name: "unicode paths survive undo and redo", run: testUnicodePathsSurviveUndoRedo },
     { name: "undo and redo block on unsnapshotted manual changes", run: testUndoAndRedoBlockOnUnsnapshottedManualChanges },

@@ -123,6 +123,8 @@ During restore, the plugin restores only the managed file set instead of doing a
 
 On Windows, restore operations retry briefly locked managed files. If a lock persists, navigation is cancelled without skipping the file and the notification identifies the Git file operation that failed. Pending recovery survives a session or extension reload; edits made after the failed restore are never overwritten automatically and can be preserved with `/checkpoint`.
 
+The plugin validates each session's shadow repository before using it. If the current session repository or the workspace reusable repository is invalid, it is preserved beside the replacement as `repo.git.invalid-<timestamp>-<uuid>` and a usable repository is rebuilt automatically. Snapshotting then continues normally, but older snapshots stored only in the invalid repository may be unavailable. Invalid repositories belonging to other sessions are skipped without modifying them.
+
 ## Configuration
 
 Configure via Pi settings:
@@ -242,6 +244,7 @@ The plugin stores history outside the workspace by default:
 Notes:
 
 - History is isolated from the user's project `.git` history
+- Invalid shadow repositories are preserved as `repo.git.invalid-<timestamp>-<uuid>` when automatic recovery is needed
 - Old workspace-local `.pi/workspace-history/` state is not migrated automatically
 - Cleanup is LRU-style based on recent use
 - In `auto` mode, the plugin disables itself in broad directories like the user home folder to avoid expensive scans and startup stalls
