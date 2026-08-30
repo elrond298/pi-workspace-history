@@ -484,6 +484,9 @@ function captureNotifications(session: Awaited<ReturnType<typeof createSession>>
   const notifications: string[] = [];
   type UIContext = Parameters<typeof session.extensionRunner.setUIContext>[0];
   const uiContext = new Proxy({
+    async select(_title: string, options: string[]): Promise<string | undefined> {
+      return options[0];
+    },
     notify(message: string): void {
       notifications.push(message);
     },
@@ -494,6 +497,236 @@ function captureNotifications(session: Awaited<ReturnType<typeof createSession>>
   }) as UIContext;
   session.extensionRunner.setUIContext(uiContext);
   return notifications;
+}
+
+interface TestUIState {
+  editorText?: string;
+  notifications: string[];
+  selections: Array<{ title: string; options: string[] }>;
+}
+
+function configureTestUI(
+  session: Awaited<ReturnType<typeof createSession>>,
+  choices: string[],
+): TestUIState {
+  const state: TestUIState = {
+    notifications: [],
+    selections: [],
+  };
+  type UIContext = Parameters<typeof session.extensionRunner.setUIContext>[0];
+  const uiContext = new Proxy({
+    async select(title: string, options: string[]): Promise<string | undefined> {
+      state.selections.push({ title, options: [...options] });
+      return choices.shift();
+    },
+    notify(message: string): void {
+      state.notifications.push(message);
+    },
+    setEditorText(text: string): void {
+      state.editorText = text;
+    },
+  }, {
+    get(target, property) {
+      return Reflect.get(target, property) ?? (() => undefined);
+    },
+  }) as UIContext;
+  session.extensionRunner.setUIContext(uiContext);
+  return state;
+}
+
+async function testUndoConversationOnlyKeepsWorkspace(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    const session = await createSession(ctx);
+    const filePath = path.join(ctx.cwd, "kept.txt");
+    const ui = configureTestUI(session, ["Conversation only (keep current files)"]);
+
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "kept.txt", content: "keep me\n" })]),
+      fauxAssistantMessage("created kept.txt"),
+    ]);
+
+    await session.prompt("create kept.txt");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "after snapshot was not created");
+
+    await session.prompt("/undo");
+
+    assert.equal(await exists(filePath), true, "conversation-only undo should keep workspace files");
+    assert.equal(normalizeEol(await readText(filePath)), "keep me\n");
+    assert.equal(ui.editorText, "create kept.txt", "undo should restore the original prompt to the editor");
+    assert.deepEqual(ui.selections, [{
+      title: "Undo",
+      options: [
+        "Conversation and workspace",
+        "Conversation only (keep current files)",
+      ],
+    }]);
+
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
+async function testRedoReusesConversationOnlyMode(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    const session = await createSession(ctx);
+    const filePath = path.join(ctx.cwd, "redo-kept.txt");
+    const ui = configureTestUI(session, ["Conversation only (keep current files)"]);
+
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "redo-kept.txt", content: "kept through redo\n" })]),
+      fauxAssistantMessage("created redo-kept.txt"),
+    ]);
+
+    await session.prompt("create redo-kept.txt");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "after snapshot was not created");
+
+    await session.prompt("/undo");
+    await session.prompt("/redo");
+
+    assert.equal(normalizeEol(await readText(filePath)), "kept through redo\n");
+    assert.equal(
+      session.sessionManager.getBranch().some((entry) => {
+        return entry.type === "message" && entry.message.role === "assistant" && getMessageText(entry) === "created redo-kept.txt";
+      }),
+      true,
+      "redo should restore the conversation branch",
+    );
+    assert.equal(ui.selections.length, 1, "redo should reuse the undo mode without prompting again");
+    assert.equal(
+      ui.notifications.includes("Redo complete. Conversation restored; current files kept."),
+      true,
+    );
+
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
+async function testNavigationChoiceCancellationKeepsConversationAndWorkspace(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    const session = await createSession(ctx);
+    const filePath = path.join(ctx.cwd, "cancelled-navigation.txt");
+
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "cancelled-navigation.txt", content: "unchanged\n" })]),
+      fauxAssistantMessage("created cancelled-navigation.txt"),
+    ]);
+
+    await session.prompt("create cancelled-navigation.txt");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "after snapshot was not created");
+    const originalLeafId = session.sessionManager.getLeafId();
+    const userEntry = session.sessionManager.getEntries().find((entry) => {
+      return entry.type === "message" && entry.message.role === "user" && getMessageText(entry) === "create cancelled-navigation.txt";
+    });
+    assert.ok(originalLeafId && userEntry, "cancel fixture history entries should exist");
+
+    const undoUI = configureTestUI(session, []);
+    await session.prompt("/undo");
+    assert.equal(session.sessionManager.getLeafId(), originalLeafId, "cancelled undo should keep the conversation leaf");
+    assert.equal(normalizeEol(await readText(filePath)), "unchanged\n");
+    assert.equal(undoUI.editorText, undefined);
+
+    const treeUI = configureTestUI(session, []);
+    const treeResult = await session.navigateTree(userEntry.id, { summarize: false });
+    assert.equal(treeResult.cancelled, true, "cancelled tree choice should cancel navigation");
+    assert.equal(session.sessionManager.getLeafId(), originalLeafId);
+    assert.equal(normalizeEol(await readText(filePath)), "unchanged\n");
+    assert.deepEqual(treeUI.selections.map(({ title }) => title), ["Tree navigation"]);
+
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
+async function testConversationOnlyUndoPreservesManualChangesAsBranchState(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    const session = await createSession(ctx);
+    const filePath = path.join(ctx.cwd, "manual-kept.txt");
+    configureTestUI(session, ["Conversation only (keep current files)"]);
+
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "manual-kept.txt", content: "agent state\n" })]),
+      fauxAssistantMessage("created manual-kept.txt"),
+    ]);
+
+    await session.prompt("create manual-kept.txt");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "after snapshot was not created");
+    const originalAssistant = session.sessionManager.getEntries().find((entry) => {
+      return entry.type === "message" && entry.message.role === "assistant" && getMessageText(entry) === "created manual-kept.txt";
+    });
+    assert.ok(originalAssistant, "manual change fixture assistant entry should exist");
+
+    await writeFile(filePath, "manual state\n", "utf8");
+    await session.prompt("/undo");
+    assert.equal(normalizeEol(await readText(filePath)), "manual state\n");
+    const keptWorkspaceEntryId = session.sessionManager.getLeafId();
+    assert.ok(keptWorkspaceEntryId, "conversation-only undo should anchor the kept workspace");
+
+    configureTestUI(session, ["Conversation and workspace", "Conversation and workspace"]);
+    const originalResult = await session.navigateTree(originalAssistant.id, { summarize: false });
+    assert.equal(originalResult.cancelled, false);
+    assert.equal(normalizeEol(await readText(filePath)), "agent state\n");
+
+    const keptResult = await session.navigateTree(keptWorkspaceEntryId, { summarize: false });
+    assert.equal(keptResult.cancelled, false, "manual state should remain reachable through its anchored branch snapshot");
+    assert.equal(normalizeEol(await readText(filePath)), "manual state\n");
+
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
+async function testTreeConversationOnlyAnchorsKeptWorkspace(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    const session = await createSession(ctx);
+    const filePath = path.join(ctx.cwd, "tree-kept.txt");
+    const ui = configureTestUI(session, [
+      "Conversation only (keep current files)",
+      "Conversation and workspace",
+    ]);
+
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "tree-kept.txt", content: "A\n" })]),
+      fauxAssistantMessage("created tree state A"),
+      fauxAssistantMessage([fauxToolCall("write", { path: "tree-kept.txt", content: "B\n" })]),
+      fauxAssistantMessage("created tree state B"),
+    ]);
+
+    await session.prompt("create tree state A");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "A snapshot was not created");
+    await session.prompt("create tree state B");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 2, "B snapshot was not created");
+
+    const aAssistant = session.sessionManager.getEntries().find((entry) => {
+      return entry.type === "message" && entry.message.role === "assistant" && getMessageText(entry) === "created tree state A";
+    });
+    const bAssistant = session.sessionManager.getEntries().find((entry) => {
+      return entry.type === "message" && entry.message.role === "assistant" && getMessageText(entry) === "created tree state B";
+    });
+    assert.ok(aAssistant && bAssistant, "tree fixture assistant messages should exist");
+
+    const conversationOnlyResult = await session.navigateTree(aAssistant.id, { summarize: false });
+    assert.equal(conversationOnlyResult.cancelled, false);
+    assert.equal(normalizeEol(await readText(filePath)), "B\n", "conversation-only tree navigation should keep B");
+
+    const returnToBResult = await session.navigateTree(bAssistant.id, { summarize: false });
+    assert.equal(returnToBResult.cancelled, false, "kept workspace should be anchored to the new conversation branch");
+    assert.equal(normalizeEol(await readText(filePath)), "B\n");
+    assert.deepEqual(ui.selections.map(({ title }) => title), ["Tree navigation", "Tree navigation"]);
+
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
 }
 
 async function testUndoRedo(): Promise<void> {
@@ -1827,6 +2060,11 @@ async function main(): Promise<void> {
     { name: "session start does not create baseline eagerly", run: testSessionStartDoesNotCreateBaselineEagerly },
     { name: "idle warmup is reused by first turn", run: testIdleWarmupIsReusedByFirstTurn },
     { name: "non-project workspace disables extension", run: testNonProjectWorkspaceDisablesExtension },
+    { name: "conversation-only undo keeps workspace", run: testUndoConversationOnlyKeepsWorkspace },
+    { name: "redo reuses conversation-only undo mode", run: testRedoReusesConversationOnlyMode },
+    { name: "cancelling navigation choice keeps conversation and workspace", run: testNavigationChoiceCancellationKeepsConversationAndWorkspace },
+    { name: "conversation-only undo preserves manual changes as branch state", run: testConversationOnlyUndoPreservesManualChangesAsBranchState },
+    { name: "conversation-only tree navigation anchors kept workspace", run: testTreeConversationOnlyAnchorsKeptWorkspace },
     { name: "undo/redo restores workspace", run: testUndoRedo },
     { name: "undo preserves manual changes before next turn", run: testManualChangesProtectedAcrossUndo },
     { name: "repeated undo walks back turn by turn", run: testRepeatedUndo },

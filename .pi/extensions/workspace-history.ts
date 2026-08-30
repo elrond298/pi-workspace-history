@@ -55,6 +55,12 @@ const PROJECT_MARKER_FILES = [
 
 type SnapshotKind = "baseline" | "before" | "after" | "manual";
 type WorkspaceComparison = "clean" | "dirty" | "missing";
+type NavigationMode = "conversationAndWorkspace" | "conversationOnly";
+
+const NAVIGATION_MODE_OPTIONS = [
+  "Conversation and workspace",
+  "Conversation only (keep current files)",
+] as const;
 
 interface WorkspaceSnapshot {
   v: 1;
@@ -87,12 +93,19 @@ interface TurnSnapshotState {
 
 interface RedoItem {
   targetId: string;
+  navigationMode?: NavigationMode;
   createdAt: string;
 }
 
 interface RedoState {
   sessionId: string;
   stack: RedoItem[];
+}
+
+interface PendingConversationOnlyNavigation {
+  commit: string;
+  oldLeafId: string | null;
+  targetId: string;
 }
 
 interface PendingRecoveryState {
@@ -108,6 +121,8 @@ interface RuntimeState {
   pendingPromptText?: string;
   internalNavigation?: "undo" | "redo";
   internalNavigationFailureReported?: boolean;
+  navigationMode?: NavigationMode;
+  pendingConversationOnlyNavigation?: PendingConversationOnlyNavigation;
   pendingRecovery?: PendingRecoveryState;
   pendingRecoveryPromise?: Promise<void>;
   cachedSettings?: WorkspaceHistorySettings;
@@ -1638,12 +1653,20 @@ async function clearRedoStack(ctx: ExtensionContext, state?: RuntimeState): Prom
   }, state);
 }
 
-async function pushRedoTarget(ctx: ExtensionContext, targetId: string, state?: RuntimeState): Promise<void> {
+async function pushRedoTarget(
+  ctx: ExtensionContext,
+  targetId: string,
+  navigationMode: NavigationMode,
+  state?: RuntimeState,
+): Promise<void> {
   const sessionId = ctx.sessionManager.getSessionId();
   const redoState = (await readRedoState(ctx, state)) ?? { sessionId, stack: [] };
   const next: RedoState = {
     sessionId,
-    stack: [...(redoState.sessionId === sessionId ? redoState.stack : []), { targetId, createdAt: new Date().toISOString() }],
+    stack: [
+      ...(redoState.sessionId === sessionId ? redoState.stack : []),
+      { targetId, navigationMode, createdAt: new Date().toISOString() },
+    ],
   };
   await writeRedoState(ctx, next, state);
 }
@@ -2177,6 +2200,25 @@ async function ensureNoUnsnapshottedChanges(
   return { currentLeafId, currentSnapshot };
 }
 
+async function selectNavigationMode(
+  ctx: ExtensionContext,
+  title: string,
+  signal?: AbortSignal,
+): Promise<NavigationMode | undefined> {
+  if (!ctx.hasUI) {
+    return "conversationAndWorkspace";
+  }
+
+  const choice = await ctx.ui.select(title, [...NAVIGATION_MODE_OPTIONS], { signal });
+  if (choice === NAVIGATION_MODE_OPTIONS[0]) {
+    return "conversationAndWorkspace";
+  }
+  if (choice === NAVIGATION_MODE_OPTIONS[1]) {
+    return "conversationOnly";
+  }
+  return undefined;
+}
+
 async function ensureWorkspaceHistoryAvailable(
   ctx: ExtensionContext,
   state: RuntimeState,
@@ -2397,6 +2439,8 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     state.pendingBeforeSnapshotPrompt = undefined;
     state.internalNavigation = undefined;
     state.internalNavigationFailureReported = undefined;
+    state.navigationMode = undefined;
+    state.pendingConversationOnlyNavigation = undefined;
     state.pendingRecovery = undefined;
     state.pendingRecoveryPromise = undefined;
     state.initialSnapshotCommit = undefined;
@@ -2578,6 +2622,14 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       await logLine(ctx, `session_before_tree skipped: ${availability.reason ?? "disabled"}`, state);
       return undefined;
     }
+    if (state.pendingConversationOnlyNavigation) {
+      await logLine(
+        ctx,
+        `discard stale conversation-only navigation target=${state.pendingConversationOnlyNavigation.targetId} commit=${state.pendingConversationOnlyNavigation.commit}`,
+        state,
+      );
+      state.pendingConversationOnlyNavigation = undefined;
+    }
     await logLine(
       ctx,
       `session_before_tree target=${event.preparation.targetId} oldLeaf=${event.preparation.oldLeafId} summarize=${String(event.preparation.userWantsSummary)} source=${state.internalNavigation ?? "tree"}`,
@@ -2593,6 +2645,37 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
 
     if (event.preparation.userWantsSummary && !state.internalNavigation) {
       return cancelNavigation("Manual /tree with summary may desync workspace and chat state. Disable summary before switching.");
+    }
+
+    const navigationMode = state.navigationMode ?? await selectNavigationMode(ctx, "Tree navigation", event.signal);
+    if (!navigationMode) {
+      await logLine(ctx, "session_before_tree cancelled: no navigation mode selected", state);
+      return { cancel: true };
+    }
+
+    if (navigationMode === "conversationOnly") {
+      try {
+        const commit = await createSnapshotCommit(
+          pi,
+          ctx,
+          "conversation-only navigation",
+          state,
+        );
+        state.pendingConversationOnlyNavigation = {
+          commit,
+          oldLeafId: event.preparation.oldLeafId,
+          targetId: event.preparation.targetId,
+        };
+        await logLine(
+          ctx,
+          `preserve workspace for conversation-only navigation target=${event.preparation.targetId} commit=${commit}`,
+          state,
+        );
+        return undefined;
+      } catch (error) {
+        await logLine(ctx, `preserve conversation-only workspace failed error=${String(error)}`, state);
+        return cancelNavigation("Could not preserve the current workspace. Navigation cancelled.");
+      }
     }
 
     const action = state.internalNavigation === "undo"
@@ -2649,10 +2732,33 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     return undefined;
   });
 
-  pi.on("session_tree", async (_event, ctx) => {
+  pi.on("session_tree", async (event, ctx) => {
     const state = getState(ctx);
+    const pendingNavigation = state.pendingConversationOnlyNavigation;
+    state.pendingConversationOnlyNavigation = undefined;
     if (!await ensureWorkspaceHistoryAvailable(ctx, state, "session_tree")) {
       return;
+    }
+    if (pendingNavigation && pendingNavigation.oldLeafId === event.oldLeafId) {
+      const commit = pendingNavigation.commit;
+      pi.appendEntry<WorkspaceSnapshot>(SNAPSHOT_TYPE, {
+        v: 1,
+        kind: "manual",
+        commit,
+        label: "conversation-only navigation",
+        createdAt: new Date().toISOString(),
+      });
+      await logLine(
+        ctx,
+        `anchor conversation-only workspace target=${pendingNavigation.targetId} commit=${commit}`,
+        state,
+      );
+    } else if (pendingNavigation) {
+      await logLine(
+        ctx,
+        `skip stale conversation-only anchor target=${pendingNavigation.targetId} commit=${pendingNavigation.commit}`,
+        state,
+      );
     }
     if (state.internalNavigation) {
       return;
@@ -2661,22 +2767,27 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
   });
 
   pi.registerCommand("undo", {
-    description: "Undo last agent turn and restore workspace",
+    description: "Undo last agent turn with optional workspace restore",
     handler: async (_args, ctx: ExtensionCommandContext) => {
       await ctx.waitForIdle();
       const state = getState(ctx);
       if (!await ensureWorkspaceHistoryAvailable(ctx, state, "undo")) {
         return;
       }
-      const precheck = await ensureNoUnsnapshottedChanges(pi, ctx, "undo", state);
-      if (!precheck) {
-        return;
-      }
-
       const after = findUndoTargetAfterSnapshot(ctx, state);
       if (!after?.userEntryId) {
         await logLine(ctx, "undo no-op: no after snapshot", state);
         ctx.ui.notify("Nothing to undo.", "info");
+        return;
+      }
+      const navigationMode = await selectNavigationMode(ctx, "Undo");
+      if (!navigationMode) {
+        return;
+      }
+      const precheck = navigationMode === "conversationAndWorkspace"
+        ? await ensureNoUnsnapshottedChanges(pi, ctx, "undo", state)
+        : { currentLeafId: ctx.sessionManager.getLeafId() ?? undefined };
+      if (!precheck) {
         return;
       }
 
@@ -2688,6 +2799,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
 
       state.internalNavigation = "undo";
       state.internalNavigationFailureReported = false;
+      state.navigationMode = navigationMode;
       try {
         const result = await ctx.navigateTree(after.userEntryId, { summarize: false });
         await logLine(ctx, `undo navigate result cancelled=${String(result.cancelled)}`, state);
@@ -2699,7 +2811,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
         }
 
         if (precheck.currentLeafId) {
-          await pushRedoTarget(ctx, precheck.currentLeafId, state);
+          await pushRedoTarget(ctx, precheck.currentLeafId, navigationMode, state);
         }
 
         const userText = extractUserText(ctx.sessionManager.getEntry(after.userEntryId));
@@ -2707,38 +2819,52 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
           ctx.ui.setEditorText(userText);
         }
 
-        ctx.ui.notify("Undo complete. Workspace restored to before that turn.", "info");
+        ctx.ui.notify(
+          navigationMode === "conversationOnly"
+            ? "Undo complete. Conversation rewound; current files kept."
+            : "Undo complete. Workspace restored to before that turn.",
+          "info",
+        );
       } finally {
         state.internalNavigation = undefined;
         state.internalNavigationFailureReported = undefined;
+        state.navigationMode = undefined;
+        state.pendingConversationOnlyNavigation = undefined;
       }
     },
   });
 
   pi.registerCommand("redo", {
-    description: "Redo previously undone agent turn and restore workspace",
+    description: "Redo previously undone navigation",
     handler: async (_args, ctx: ExtensionCommandContext) => {
       await ctx.waitForIdle();
       const state = getState(ctx);
       if (!await ensureWorkspaceHistoryAvailable(ctx, state, "redo")) {
         return;
       }
-      const precheck = await ensureNoUnsnapshottedChanges(pi, ctx, "redo", state);
-      if (!precheck) {
-        return;
-      }
-
       const redo = await peekRedoTarget(ctx, state);
       if (!redo) {
         await logLine(ctx, "redo no-op: empty stack", state);
         ctx.ui.notify("Nothing to redo.", "info");
         return;
       }
+      const navigationMode = redo.navigationMode ?? "conversationAndWorkspace";
+      if (
+        navigationMode === "conversationAndWorkspace" &&
+        !await ensureNoUnsnapshottedChanges(pi, ctx, "redo", state)
+      ) {
+        return;
+      }
 
-      await logLine(ctx, `redo start currentLeaf=${ctx.sessionManager.getLeafId()} target=${redo.targetId}`, state);
+      await logLine(
+        ctx,
+        `redo start currentLeaf=${ctx.sessionManager.getLeafId()} target=${redo.targetId} mode=${navigationMode}`,
+        state,
+      );
 
       state.internalNavigation = "redo";
       state.internalNavigationFailureReported = false;
+      state.navigationMode = navigationMode;
       try {
         const result = await ctx.navigateTree(redo.targetId, { summarize: false });
         await logLine(ctx, `redo navigate result cancelled=${String(result.cancelled)}`, state);
@@ -2751,10 +2877,17 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
 
         await popRedoTarget(ctx, state);
 
-        ctx.ui.notify("Redo complete. Workspace restored.", "info");
+        ctx.ui.notify(
+          navigationMode === "conversationOnly"
+            ? "Redo complete. Conversation restored; current files kept."
+            : "Redo complete. Workspace restored.",
+          "info",
+        );
       } finally {
         state.internalNavigation = undefined;
         state.internalNavigationFailureReported = undefined;
+        state.navigationMode = undefined;
+        state.pendingConversationOnlyNavigation = undefined;
       }
     },
   });
