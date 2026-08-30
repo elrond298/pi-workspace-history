@@ -481,22 +481,7 @@ function findBaselineSnapshot(session: Awaited<ReturnType<typeof createSession>>
 }
 
 function captureNotifications(session: Awaited<ReturnType<typeof createSession>>): string[] {
-  const notifications: string[] = [];
-  type UIContext = Parameters<typeof session.extensionRunner.setUIContext>[0];
-  const uiContext = new Proxy({
-    async select(_title: string, options: string[]): Promise<string | undefined> {
-      return options[0];
-    },
-    notify(message: string): void {
-      notifications.push(message);
-    },
-  }, {
-    get(target, property) {
-      return Reflect.get(target, property) ?? (() => undefined);
-    },
-  }) as UIContext;
-  session.extensionRunner.setUIContext(uiContext);
-  return notifications;
+  return configureTestUI(session, [], true).notifications;
 }
 
 interface TestUIState {
@@ -508,6 +493,7 @@ interface TestUIState {
 function configureTestUI(
   session: Awaited<ReturnType<typeof createSession>>,
   choices: string[],
+  selectFirstByDefault = false,
 ): TestUIState {
   const state: TestUIState = {
     notifications: [],
@@ -517,7 +503,7 @@ function configureTestUI(
   const uiContext = new Proxy({
     async select(title: string, options: string[]): Promise<string | undefined> {
       state.selections.push({ title, options: [...options] });
-      return choices.shift();
+      return choices.shift() ?? (selectFirstByDefault ? options[0] : undefined);
     },
     notify(message: string): void {
       state.notifications.push(message);
@@ -554,13 +540,16 @@ async function testUndoConversationOnlyKeepsWorkspace(): Promise<void> {
     assert.equal(await exists(filePath), true, "conversation-only undo should keep workspace files");
     assert.equal(normalizeEol(await readText(filePath)), "keep me\n");
     assert.equal(ui.editorText, "create kept.txt", "undo should restore the original prompt to the editor");
-    assert.deepEqual(ui.selections, [{
-      title: "Undo",
-      options: [
-        "Conversation and workspace",
-        "Conversation only (keep current files)",
-      ],
-    }]);
+    assert.deepEqual(
+      ui.selections,
+      [{
+        title: "Undo",
+        options: [
+          "Conversation and workspace",
+          "Conversation only (keep current files)",
+        ],
+      }],
+    );
 
     session.dispose();
   } finally {
@@ -666,16 +655,24 @@ async function testConversationOnlyUndoPreservesManualChangesAsBranchState(): Pr
     await writeFile(filePath, "manual state\n", "utf8");
     await session.prompt("/undo");
     assert.equal(normalizeEol(await readText(filePath)), "manual state\n");
-    const keptWorkspaceEntryId = session.sessionManager.getLeafId();
-    assert.ok(keptWorkspaceEntryId, "conversation-only undo should anchor the kept workspace");
+
+    ctx.provider.setResponses([fauxAssistantMessage("continued from kept manual state")]);
+    await session.prompt("continue from the kept workspace");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 2, "continued branch snapshot was not created");
+    const keptBranchAssistant = session.sessionManager.getEntries().find((entry) => {
+      return entry.type === "message" &&
+        entry.message.role === "assistant" &&
+        getMessageText(entry) === "continued from kept manual state";
+    });
+    assert.ok(keptBranchAssistant, "the kept workspace branch should have a visible assistant node");
 
     configureTestUI(session, ["Conversation and workspace", "Conversation and workspace"]);
     const originalResult = await session.navigateTree(originalAssistant.id, { summarize: false });
     assert.equal(originalResult.cancelled, false);
     assert.equal(normalizeEol(await readText(filePath)), "agent state\n");
 
-    const keptResult = await session.navigateTree(keptWorkspaceEntryId, { summarize: false });
-    assert.equal(keptResult.cancelled, false, "manual state should remain reachable through its anchored branch snapshot");
+    const keptResult = await session.navigateTree(keptBranchAssistant.id, { summarize: false });
+    assert.equal(keptResult.cancelled, false, "manual state should remain reachable through the visible continued branch");
     assert.equal(normalizeEol(await readText(filePath)), "manual state\n");
 
     session.dispose();
@@ -725,6 +722,251 @@ async function testTreeConversationOnlyAnchorsKeptWorkspace(): Promise<void> {
 
     session.dispose();
   } finally {
+    await disposeContext(ctx);
+  }
+}
+
+async function testTreeConversationOnlySupportsBranchSummary(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    const session = await createSession(ctx);
+    const filePath = path.join(ctx.cwd, "tree-summary-kept.txt");
+    const ui = configureTestUI(session, ["Conversation only (keep current files)"]);
+
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "tree-summary-kept.txt", content: "A\n" })]),
+      fauxAssistantMessage("created summary state A"),
+      fauxAssistantMessage([fauxToolCall("write", { path: "tree-summary-kept.txt", content: "B\n" })]),
+      fauxAssistantMessage("created summary state B"),
+      fauxAssistantMessage("Summary of the abandoned B branch."),
+    ]);
+
+    await session.prompt("create summary state A");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "summary A snapshot was not created");
+    await session.prompt("create summary state B");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 2, "summary B snapshot was not created");
+
+    const aAssistant = session.sessionManager.getEntries().find((entry) => {
+      return entry.type === "message" && entry.message.role === "assistant" && getMessageText(entry) === "created summary state A";
+    });
+    assert.ok(aAssistant, "summary fixture A assistant message should exist");
+
+    const result = await session.navigateTree(aAssistant.id, { summarize: true });
+
+    assert.equal(result.cancelled, false, "conversation-only tree navigation should allow branch summaries");
+    assert.ok(result.summaryEntry, "summary navigation should create a branch summary entry");
+    assert.equal(normalizeEol(await readText(filePath)), "B\n", "summary navigation should keep the current workspace");
+    assert.deepEqual(ui.selections.map(({ title }) => title), ["Tree navigation"]);
+
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
+async function testCancelledConversationOnlySummaryDoesNotLeakAnchor(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    const session = await createSession(ctx);
+    const filePath = path.join(ctx.cwd, "cancelled-summary.txt");
+    const ui = configureTestUI(session, [
+      "Conversation only (keep current files)",
+      "Conversation and workspace",
+    ]);
+
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "cancelled-summary.txt", content: "A\n" })]),
+      fauxAssistantMessage("created cancelled summary A"),
+      fauxAssistantMessage([fauxToolCall("write", { path: "cancelled-summary.txt", content: "B\n" })]),
+      fauxAssistantMessage("created cancelled summary B"),
+      fauxAssistantMessage("This summary should be aborted."),
+    ]);
+
+    await session.prompt("create cancelled summary A");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "cancelled summary A snapshot was not created");
+    await session.prompt("create cancelled summary B");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 2, "cancelled summary B snapshot was not created");
+
+    const aAssistant = session.sessionManager.getEntries().find((entry) => {
+      return entry.type === "message" && entry.message.role === "assistant" && getMessageText(entry) === "created cancelled summary A";
+    });
+    assert.ok(aAssistant, "cancelled summary fixture A assistant message should exist");
+    const leafBeforeSummary = session.sessionManager.getLeafId();
+
+    const summaryNavigation = session.navigateTree(aAssistant.id, { summarize: true });
+    session.abortBranchSummary();
+    const summaryResult = await summaryNavigation;
+
+    assert.equal(summaryResult.aborted, true, "summary navigation should report the abort");
+    assert.equal(session.sessionManager.getLeafId(), leafBeforeSummary, "an aborted summary should keep the conversation leaf");
+    assert.equal(normalizeEol(await readText(filePath)), "B\n", "an aborted summary should keep the workspace");
+
+    const combinedResult = await session.navigateTree(aAssistant.id, { summarize: false });
+    assert.equal(combinedResult.cancelled, false, "navigation after an aborted summary should not reuse its pending anchor");
+    assert.equal(normalizeEol(await readText(filePath)), "A\n");
+    assert.equal(await countSnapshots(session, ctx.cwd, "manual"), 0, "an aborted summary must not anchor its snapshot later");
+    assert.deepEqual(ui.selections.map(({ title }) => title), ["Tree navigation", "Tree navigation"]);
+
+    const aSnapshot = (await readTurnSnapshots(session, ctx.cwd)).turns[0];
+    assert.ok(aSnapshot, "cancelled summary A turn snapshot should exist");
+    const { stdout: shadowHead } = await execFileAsync(
+      "git",
+      shadowGitArgs(session, ctx.cwd, "rev-parse", "HEAD"),
+      { cwd: ctx.cwd },
+    );
+    assert.equal(shadowHead.trim(), aSnapshot.afterCommit, "shadow Git should end at the successful combined target");
+    assert.equal(await getShadowStatus(session, ctx.cwd), "", "shadow Git should remain clean after the aborted summary retry");
+
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
+async function testConversationOnlyNavigationRecoversPendingWorkspaceBeforeAnchoring(): Promise<void> {
+  const ctx = await createContext();
+  let resumedCtx: TestContext | undefined;
+  try {
+    let session = await createSession(ctx);
+    const filePath = path.join(ctx.cwd, "pending-conversation-only.txt");
+
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "pending-conversation-only.txt", content: "A\n" })]),
+      fauxAssistantMessage("created pending state A"),
+      fauxAssistantMessage([fauxToolCall("write", { path: "pending-conversation-only.txt", content: "B\n" })]),
+      fauxAssistantMessage("created pending state B"),
+    ]);
+
+    await session.prompt("create pending state A");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "pending A snapshot was not created");
+    await session.prompt("create pending state B");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 2, "pending B snapshot was not created");
+
+    const aAssistant = session.sessionManager.getEntries().find((entry) => {
+      return entry.type === "message" && entry.message.role === "assistant" && getMessageText(entry) === "created pending state A";
+    });
+    const bAssistant = session.sessionManager.getEntries().find((entry) => {
+      return entry.type === "message" && entry.message.role === "assistant" && getMessageText(entry) === "created pending state B";
+    });
+    const bSnapshot = (await readTurnSnapshots(session, ctx.cwd)).turns[1];
+    assert.ok(aAssistant && bAssistant && bSnapshot, "pending recovery fixture should have both branches and snapshots");
+
+    await writeFile(filePath, "partial restore\n", "utf8");
+    await refreshShadowIndex(session, ctx.cwd);
+    const { stdout: partialTree } = await execFileAsync(
+      "git",
+      shadowGitArgs(session, ctx.cwd, "write-tree"),
+      { cwd: ctx.cwd },
+    );
+    await execFileAsync(
+      "git",
+      shadowGitArgs(session, ctx.cwd, "reset", "--mixed", "--no-refresh", bSnapshot.afterCommit),
+      { cwd: ctx.cwd },
+    );
+    await writeFile(getPendingRecoveryFile(session, ctx.cwd), `${JSON.stringify({
+      version: 1,
+      commit: bSnapshot.afterCommit,
+      workspaceTree: partialTree.trim(),
+      createdAt: new Date().toISOString(),
+    }, null, 2)}\n`, "utf8");
+
+    const sessionManager = session.sessionManager;
+    session.dispose();
+    resumedCtx = await createContextForWorkspace(ctx.rootDir, ctx.cwd);
+    session = await createSession(resumedCtx, sessionManager);
+    configureTestUI(session, [
+      "Conversation only (keep current files)",
+      "Conversation only (keep current files)",
+      "Conversation and workspace",
+    ]);
+
+    resumedCtx.provider.setResponses([fauxAssistantMessage("Summary generation must not start while recovery is pending.")]);
+    const leafBeforeSummary = session.sessionManager.getLeafId();
+    const summaryResult = await session.navigateTree(aAssistant.id, { summarize: true });
+    assert.equal(summaryResult.cancelled, true, "pending recovery should safely block summary navigation");
+    assert.equal(session.sessionManager.getLeafId(), leafBeforeSummary, "blocked summary navigation should keep the conversation leaf");
+    assert.equal(normalizeEol(await readText(filePath)), "partial restore\n", "blocked summary navigation should not run recovery early");
+    assert.equal(await pathExists(getPendingRecoveryFile(session, ctx.cwd)), true, "blocked summary should leave recovery pending");
+
+    const conversationOnlyResult = await session.navigateTree(aAssistant.id, { summarize: false });
+    assert.equal(conversationOnlyResult.cancelled, false);
+    assert.equal(
+      normalizeEol(await readText(filePath)),
+      "B\n",
+      "pending rollback should finish before anchoring a conversation-only branch",
+    );
+    assert.equal(await pathExists(getPendingRecoveryFile(session, ctx.cwd)), false, "successful recovery should clear pending state");
+
+    const combinedResult = await session.navigateTree(bAssistant.id, { summarize: false });
+    assert.equal(combinedResult.cancelled, false, "the recovered anchor should remain usable by later combined navigation");
+    assert.equal(normalizeEol(await readText(filePath)), "B\n");
+
+    session.dispose();
+  } finally {
+    resumedCtx?.provider.unregister();
+    await disposeContext(ctx);
+  }
+}
+
+async function testConversationOnlyNavigationPreservesEditsAfterPendingRecovery(): Promise<void> {
+  const ctx = await createContext();
+  let resumedCtx: TestContext | undefined;
+  try {
+    let session = await createSession(ctx);
+    const trackedPath = path.join(ctx.cwd, "pending-later-edits.txt");
+    const manualPath = path.join(ctx.cwd, "later-manual.txt");
+
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "pending-later-edits.txt", content: "tracked\n" })]),
+      fauxAssistantMessage("created pending later edits state"),
+    ]);
+    await session.prompt("create pending later edits state");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "pending later edits snapshot was not created");
+
+    const originalAssistant = session.sessionManager.getEntries().find((entry) => {
+      return entry.type === "message" &&
+        entry.message.role === "assistant" &&
+        getMessageText(entry) === "created pending later edits state";
+    });
+    const turn = (await readTurnSnapshots(session, ctx.cwd)).turns[0];
+    assert.ok(originalAssistant && turn, "pending later edits fixture should have an assistant and snapshot");
+
+    const { stdout: workspaceTree } = await execFileAsync(
+      "git",
+      shadowGitArgs(session, ctx.cwd, "rev-parse", `${turn.afterCommit}^{tree}`),
+      { cwd: ctx.cwd },
+    );
+    await writeFile(getPendingRecoveryFile(session, ctx.cwd), `${JSON.stringify({
+      version: 1,
+      commit: turn.afterCommit,
+      workspaceTree: workspaceTree.trim(),
+      createdAt: new Date().toISOString(),
+    }, null, 2)}\n`, "utf8");
+
+    const sessionManager = session.sessionManager;
+    session.dispose();
+    resumedCtx = await createContextForWorkspace(ctx.rootDir, ctx.cwd);
+    session = await createSession(resumedCtx, sessionManager);
+    configureTestUI(session, [
+      "Conversation only (keep current files)",
+      "Conversation and workspace",
+    ]);
+    await writeFile(manualPath, "keep later manual edit\n", "utf8");
+
+    await session.prompt("/undo");
+
+    assert.equal(normalizeEol(await readText(trackedPath)), "tracked\n");
+    assert.equal(normalizeEol(await readText(manualPath)), "keep later manual edit\n");
+    assert.equal(await pathExists(getPendingRecoveryFile(session, ctx.cwd)), false, "kept manual edits should supersede pending recovery");
+
+    const combinedResult = await session.navigateTree(originalAssistant.id, { summarize: false });
+    assert.equal(combinedResult.cancelled, false, "the preserved workspace anchor should support later combined navigation");
+    assert.equal(normalizeEol(await readText(trackedPath)), "tracked\n");
+    assert.equal(await pathExists(manualPath), false, "combined navigation should restore the original branch after preserving edits");
+
+    session.dispose();
+  } finally {
+    resumedCtx?.provider.unregister();
     await disposeContext(ctx);
   }
 }
@@ -2065,6 +2307,10 @@ async function main(): Promise<void> {
     { name: "cancelling navigation choice keeps conversation and workspace", run: testNavigationChoiceCancellationKeepsConversationAndWorkspace },
     { name: "conversation-only undo preserves manual changes as branch state", run: testConversationOnlyUndoPreservesManualChangesAsBranchState },
     { name: "conversation-only tree navigation anchors kept workspace", run: testTreeConversationOnlyAnchorsKeptWorkspace },
+    { name: "conversation-only tree navigation supports branch summaries", run: testTreeConversationOnlySupportsBranchSummary },
+    { name: "cancelled conversation-only summary does not leak its anchor", run: testCancelledConversationOnlySummaryDoesNotLeakAnchor },
+    { name: "conversation-only navigation recovers pending workspace before anchoring", run: testConversationOnlyNavigationRecoversPendingWorkspaceBeforeAnchoring },
+    { name: "conversation-only navigation preserves edits after pending recovery", run: testConversationOnlyNavigationPreservesEditsAfterPendingRecovery },
     { name: "undo/redo restores workspace", run: testUndoRedo },
     { name: "undo preserves manual changes before next turn", run: testManualChangesProtectedAcrossUndo },
     { name: "repeated undo walks back turn by turn", run: testRepeatedUndo },

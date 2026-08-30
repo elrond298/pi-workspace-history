@@ -2643,13 +2643,47 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       return { cancel: true as const };
     };
 
-    if (event.preparation.userWantsSummary && !state.internalNavigation) {
-      return cancelNavigation("Manual /tree with summary may desync workspace and chat state. Disable summary before switching.");
-    }
-
     const navigationMode = state.navigationMode ?? await selectNavigationMode(ctx, "Tree navigation", event.signal);
     if (!navigationMode) {
       await logLine(ctx, "session_before_tree cancelled: no navigation mode selected", state);
+      return { cancel: true };
+    }
+
+    if (
+      event.preparation.userWantsSummary &&
+      !state.internalNavigation &&
+      navigationMode === "conversationAndWorkspace"
+    ) {
+      return cancelNavigation(
+        "Tree navigation with a summary cannot safely restore workspace files. Choose conversation only or disable the summary.",
+      );
+    }
+
+    if (
+      event.preparation.userWantsSummary &&
+      navigationMode === "conversationOnly" &&
+      state.pendingRecovery
+    ) {
+      return cancelNavigation(
+        "Workspace recovery is pending. Retry without a branch summary, or run /checkpoint to preserve later edits first.",
+      );
+    }
+
+    const action = state.internalNavigation === "undo"
+      ? "Undo"
+      : state.internalNavigation === "redo"
+        ? "Redo"
+        : "Tree navigation";
+    if (!await tryRecoverPendingWorkspace(
+      pi,
+      ctx,
+      state,
+      action,
+      navigationMode === "conversationOnly",
+    )) {
+      if (state.internalNavigation) {
+        state.internalNavigationFailureReported = true;
+      }
       return { cancel: true };
     }
 
@@ -2676,18 +2710,6 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
         await logLine(ctx, `preserve conversation-only workspace failed error=${String(error)}`, state);
         return cancelNavigation("Could not preserve the current workspace. Navigation cancelled.");
       }
-    }
-
-    const action = state.internalNavigation === "undo"
-      ? "Undo"
-      : state.internalNavigation === "redo"
-        ? "Redo"
-        : "Tree navigation";
-    if (!await tryRecoverPendingWorkspace(pi, ctx, state, action)) {
-      if (state.internalNavigation) {
-        state.internalNavigationFailureReported = true;
-      }
-      return { cancel: true };
     }
 
     const currentLeafId = ctx.sessionManager.getLeafId();

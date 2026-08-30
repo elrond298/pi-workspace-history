@@ -89,6 +89,8 @@ This plugin is built around the following concrete requirements:
   - Choose whether to restore the matching workspace state after selecting a history node
   - Applies to `/tree` and Pi's double-Escape tree shortcut
   - Supports moving between historical branches
+  - Branch summaries are supported with conversation-only navigation; combined workspace restore remains blocked when a summary is requested because summary generation can still be cancelled before chat navigation completes
+  - If recovery from an earlier interrupted restore is still pending, summary navigation is cancelled without changing files; retry without a summary or preserve later edits with `/checkpoint`
 
 - Dirty guard
   - Blocks risky workspace restore when the workspace contains unsnapshotted manual changes
@@ -102,7 +104,7 @@ This plugin is built around the following concrete requirements:
 
 The plugin stores snapshots in an internal shadow git repository instead of relying on the user's project `.git` history.
 
-For conversation-only navigation, the plugin snapshots the current files before moving the conversation and anchors that snapshot to the new history branch. Later `/tree` and `/redo` operations therefore remain consistent instead of treating the intentionally kept files as unknown manual changes. Cancelling the choice leaves both conversation and workspace unchanged. In non-interactive modes, navigation keeps the previous combined conversation-and-workspace behavior.
+For conversation-only navigation without a branch summary, the plugin first resolves any pending recovery from an earlier interrupted restore. If files changed after that interrupted restore, those later edits are kept automatically. The plugin then snapshots the current files before moving the conversation and uses the snapshot as the seed of the continued history branch. Once the conversation continues, its normal visible message nodes restore that kept workspace state through `/tree`. Cancelling the choice leaves both conversation and workspace unchanged. In non-interactive modes, navigation keeps the previous combined conversation-and-workspace behavior.
 
 Default snapshot scope:
 
