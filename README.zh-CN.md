@@ -18,7 +18,7 @@
 
 ## 这是什么
 
-`workspace-history` 是一个面向 `@mariozechner/pi-coding-agent` 的工作区历史插件。
+`workspace-history` 是一个面向 `@earendil-works/pi-coding-agent` 0.84.4 及以上版本的工作区历史插件，需要 Node.js 22.19.0 或更高版本。
 
 它不是单纯给 `pi` 增加一个 `/undo` 命令，而是要协调聊天历史与本地工作区的真实状态，同时允许用户选择是否随导航恢复文件。
 
@@ -76,6 +76,7 @@
   - 可选择同时恢复对话和工作区，或只回退对话
   - 第一项默认保持原有的同步恢复行为
   - 把该轮用户 prompt 放回输入框，方便修改后重试
+  - 把原始 prompt、全部工具轮次、自动重试、compaction continuation，以及排队的 `steer` / `followUp` 输入视为同一个操作
 
 - `/redo`
   - 回到刚才 `/undo` 之前的位置
@@ -91,6 +92,7 @@
   - 支持在不同历史分支之间来回切换
   - 选择“只回退对话”时支持生成分支摘要；请求摘要时仍会阻止“同时恢复工作区”，因为摘要生成可能在对话切换完成前被取消
   - 如果此前中断的恢复仍待处理，摘要导航会在不修改文件的情况下取消；可改用不生成摘要的导航，或先用 `/checkpoint` 保留后续修改
+  - user、assistant、tool result、custom message、compaction 和 branch summary 节点都会解析到对应操作的精确快照；没有精确语义锚点时会取消恢复
 
 - Dirty guard
   - 如果当前工作区有未快照的手动修改，会阻止危险的工作区恢复
@@ -103,6 +105,8 @@
 ## 工作方式
 
 插件内部使用独立的 shadow git 来保存快照，而不是依赖用户项目本身的 `.git` 历史。
+
+一个撤销单元从原始 prompt 开始，直到 Pi 报告 Agent 已 settled 为止。中间工具轮次各自拥有 `/tree` 锚点，但排队输入不会替换该操作最初的 prompt 或 `before` 快照。因此，一次 `/undo` 会完整撤销多轮工具调用的全部结果，`/redo` 也会把它作为整体恢复。
 
 只回退对话且不生成分支摘要时，插件会先处理此前中断恢复留下的待恢复工作；如果中断恢复后文件又被修改，这些后续修改会自动保留。随后插件快照当前文件，并将其作为后续历史分支的起点。继续对话后，分支中正常可见的消息节点即可通过 `/tree` 恢复这份保留的工作区状态。取消选择时，对话和工作区都不改变；非交互模式继续沿用原来的“对话和工作区一起恢复”行为。
 
@@ -125,6 +129,8 @@
 - `coverage/`
 - `.env`
 - `.env.*`
+
+这些路径属于硬排除。即使工作区 `.gitignore` 写了 `!.env.local` 或 `!node_modules/example.js`，也不能把它们重新纳入快照。升级后，新快照还会移除旧版本曾纳管的排除路径；恢复旧快照时也不会覆盖当前的排除文件。
 
 恢复时，插件只恢复它纳管的文件集合，不会粗暴地对整个工作区做无差别清理。
 
@@ -156,6 +162,7 @@
 - `workspaceHistory.storageDir`
   - shadow history 的外部存储根目录
   - 默认：`~/.pi/agent/state/workspace-history`
+  - 必须位于工作区之外。如果它等于工作区或位于工作区内部，即使 `enabled` 为 `true`，插件也会禁用，且不会在其中创建历史目录。
 - `workspaceHistory.maxSessionsPerWorkspace`
   - 每个工作区最多保留最近使用的 session 数
   - 默认：`3`
@@ -163,15 +170,16 @@
   - 全局最多保留最近使用的工作区数
   - 默认：`10`
 - `workspaceHistory.enabled`
-  - `auto`（默认）会在非项目目录自动禁用插件
+  - `auto`（默认）在当前目录或祖先目录存在已声明项目标记时启用
   - `true` 强制启用
   - `false` 完全禁用
 - `workspaceHistory.allowHomeDirectory`
   - 是否允许在用户 home 目录启用
   - 默认：`false`
 - `workspaceHistory.requireProjectMarker`
-  - 是否要求存在 `.git`、`package.json` 等项目标记
+  - 是否要求当前目录或祖先目录存在 `.git`、`package.json`、`Cargo.toml`、`go.mod`、`pyproject.toml` 等项目标记
   - 默认：`true`
+  - 设为 `false` 时，自动模式允许文件系统根目录和用户 home 目录以外的任意目录（home 目录仍需同时启用 `allowHomeDirectory`）
 - `workspaceHistory.maxScanFiles` / `workspaceHistory.maxScanDirs` / `workspaceHistory.maxScanMs`
   - 工作区扫描的安全预算
 - `workspaceHistory.gitTimeoutMs`
@@ -211,6 +219,8 @@ pi install /path/to/workspace-history
 
 ## 测试
 
+开发与 CI 使用 `@earendil-works/pi-coding-agent` 0.84.4 和 Node.js 22.19.0，并同时在 Linux 与 Windows 上运行。
+
 运行自动化测试：
 
 ```bash
@@ -225,10 +235,10 @@ npm run typecheck
 
 ## 最近更新
 
-- 历史默认存到工作区外
-- 增加 `workspaceHistory.storageDir`
-- 增加 session / workspace 保留策略
-- 通过缓存设置/路径和节流 cleanup 降低运行时开销
+- 完整的多轮 Agent 操作现在作为一个 undo / redo 单元
+- 即使 `.gitignore` 使用反向规则，硬排除路径也不会重新被纳管
+- Git、Rust、Go、Python 等项目标记可从祖先目录识别
+- 无效 shadow repo 会自动隔离并重建
 
 ## 存储目录
 
@@ -254,4 +264,5 @@ npm run typecheck
 - 自动恢复时，无效的 shadow repo 会保留为 `repo.git.invalid-<timestamp>-<uuid>`
 - 旧的工作区内 `.pi/workspace-history/` 状态不会自动迁移
 - 清理策略基于最近使用时间（LRU 风格）
+- 保留清理只删除元数据有效且不是当前对象的目录；元数据损坏的目录会保留，便于人工恢复
 - 在 `auto` 模式下，插件会在像用户 home 目录这样的宽泛目录里自动禁用，避免启动扫描过大导致卡顿
