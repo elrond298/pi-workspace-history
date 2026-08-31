@@ -1589,6 +1589,77 @@ async function testInvalidCurrentShadowRepoIsQuarantinedAndRebuilt(): Promise<vo
   }
 }
 
+async function testRepeatedUndoAcrossManualInterTurnChanges(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    const session = await createSession(ctx);
+    const filePath = path.join(ctx.cwd, "manual-between-undos.txt");
+    const notifications = captureNotifications(session);
+
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "manual-between-undos.txt", content: "first agent state\n" })]),
+      fauxAssistantMessage("created first agent state"),
+      fauxAssistantMessage([fauxToolCall("write", { path: "manual-between-undos.txt", content: "second agent state\n" })]),
+      fauxAssistantMessage("created second agent state"),
+    ]);
+
+    await session.prompt("create first agent state");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "first inter-turn snapshot was not created");
+    await writeFile(filePath, "manual state between turns\n", "utf8");
+    await session.prompt("create second agent state");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 2, "second inter-turn snapshot was not created");
+    const firstAssistant = session.sessionManager.getEntries().find((entry) => {
+      return entry.type === "message" && entry.message.role === "assistant" && getMessageText(entry) === "created first agent state";
+    });
+    const turns = (await readTurnSnapshots(session, ctx.cwd)).turns;
+    assert.ok(firstAssistant && turns[0] && turns[1], "inter-turn fixture should have both assistant entries and snapshots");
+    assert.notEqual(
+      turns[1].beforeCommit,
+      turns[0].afterCommit,
+      "the manual inter-turn state should differ from the first turn's after snapshot",
+    );
+
+    await session.prompt("/undo");
+    assert.equal(
+      normalizeEol(await readText(filePath)),
+      "manual state between turns\n",
+      "first undo should restore the manual state captured before the second turn",
+    );
+    const firstUndoLeafId = session.sessionManager.getLeafId();
+    const firstUndoAnchor = firstUndoLeafId ? session.sessionManager.getEntry(firstUndoLeafId) : undefined;
+    assert.equal(firstUndoAnchor?.type, "custom", "first undo should anchor the divergent restored workspace");
+    assert.equal(firstUndoAnchor?.parentId, firstAssistant.id, "the restored workspace anchor should follow the first assistant");
+    if (firstUndoAnchor?.type === "custom") {
+      const anchorData = firstUndoAnchor.data as Partial<{ commit: string; kind: string; label: string }> | undefined;
+      assert.equal(firstUndoAnchor.customType, "workspace-history.snapshot");
+      assert.equal(anchorData?.kind, "manual");
+      assert.equal(anchorData?.commit, turns[1].beforeCommit);
+      assert.equal(anchorData?.label, "restored workspace navigation");
+    }
+    const { stdout: shadowHead } = await execFileAsync(
+      "git",
+      shadowGitArgs(session, ctx.cwd, "rev-parse", "HEAD"),
+      { cwd: ctx.cwd },
+    );
+    assert.equal(shadowHead.trim(), turns[1].beforeCommit, "first undo should align shadow HEAD with the restored manual state");
+    assert.equal(await getShadowStatus(session, ctx.cwd), "", "first undo should leave the shadow index clean");
+
+    notifications.length = 0;
+    await session.prompt("/undo");
+
+    assert.equal(
+      notifications.some((message) => message.includes("unsnapshotted changes")),
+      false,
+      "the restored inter-turn state should not be mistaken for unsnapshotted changes",
+    );
+    assert.equal(await pathExists(filePath), false, "second undo should restore the workspace from before the first turn");
+
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
 async function testInvalidReusableShadowRepoIsQuarantinedAndRebuilt(): Promise<void> {
   const ctx1 = await createContext();
   try {
@@ -2314,6 +2385,7 @@ async function main(): Promise<void> {
     { name: "undo/redo restores workspace", run: testUndoRedo },
     { name: "undo preserves manual changes before next turn", run: testManualChangesProtectedAcrossUndo },
     { name: "repeated undo walks back turn by turn", run: testRepeatedUndo },
+    { name: "repeated undo crosses manual inter-turn changes", run: testRepeatedUndoAcrossManualInterTurnChanges },
     { name: "checkpoint and dirty tree guard", run: testCheckpointAndTreeGuard },
     { name: "tree switching restores branch-specific workspace", run: testTreeBranchSwitching },
     { name: "undo does not leak across sessions", run: testUndoDoesNotLeakAcrossSessions },
@@ -2338,7 +2410,13 @@ async function main(): Promise<void> {
     { name: "pending recovery preserves later manual edits", run: testPendingRecoveryPreservesLaterManualEdits },
   ];
 
-  for (const test of tests) {
+  const testFilter = process.env.WORKSPACE_HISTORY_TEST_FILTER?.trim().toLowerCase();
+  const selectedTests = testFilter
+    ? tests.filter((test) => test.name.toLowerCase().includes(testFilter))
+    : tests;
+  assert.ok(selectedTests.length > 0, `No tests matched WORKSPACE_HISTORY_TEST_FILTER=${String(testFilter)}`);
+
+  for (const test of selectedTests) {
     process.stdout.write(`RUN ${test.name}\n`);
     await test.run();
     process.stdout.write(`PASS ${test.name}\n`);

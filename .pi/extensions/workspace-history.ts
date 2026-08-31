@@ -102,8 +102,9 @@ interface RedoState {
   stack: RedoItem[];
 }
 
-interface PendingConversationOnlyNavigation {
+interface PendingWorkspaceAnchor {
   commit: string;
+  label: string;
   oldLeafId: string | null;
   targetId: string;
 }
@@ -122,7 +123,7 @@ interface RuntimeState {
   internalNavigation?: "undo" | "redo";
   internalNavigationFailureReported?: boolean;
   navigationMode?: NavigationMode;
-  pendingConversationOnlyNavigation?: PendingConversationOnlyNavigation;
+  pendingWorkspaceAnchor?: PendingWorkspaceAnchor;
   pendingRecovery?: PendingRecoveryState;
   pendingRecoveryPromise?: Promise<void>;
   cachedSettings?: WorkspaceHistorySettings;
@@ -1713,6 +1714,20 @@ function isUserMessageEntry(entry: SessionEntry | undefined): entry is SessionMe
   return entry?.type === "message" && entry.message.role === "user";
 }
 
+function getTreeNavigationResultLeafId(
+  ctx: ExtensionContext,
+  targetId: string,
+): string | null | undefined {
+  const target = ctx.sessionManager.getEntry(targetId);
+  if (!target) {
+    return undefined;
+  }
+  if (isUserMessageEntry(target) || target.type === "custom_message") {
+    return target.parentId;
+  }
+  return target.id;
+}
+
 function getSnapshotEntries(ctx: ExtensionContext): Array<CustomEntry<WorkspaceSnapshot>> {
   return getEntries(ctx).filter(isSnapshotEntry);
 }
@@ -2440,7 +2455,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     state.internalNavigation = undefined;
     state.internalNavigationFailureReported = undefined;
     state.navigationMode = undefined;
-    state.pendingConversationOnlyNavigation = undefined;
+    state.pendingWorkspaceAnchor = undefined;
     state.pendingRecovery = undefined;
     state.pendingRecoveryPromise = undefined;
     state.initialSnapshotCommit = undefined;
@@ -2622,13 +2637,13 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       await logLine(ctx, `session_before_tree skipped: ${availability.reason ?? "disabled"}`, state);
       return undefined;
     }
-    if (state.pendingConversationOnlyNavigation) {
+    if (state.pendingWorkspaceAnchor) {
       await logLine(
         ctx,
-        `discard stale conversation-only navigation target=${state.pendingConversationOnlyNavigation.targetId} commit=${state.pendingConversationOnlyNavigation.commit}`,
+        `discard stale workspace anchor target=${state.pendingWorkspaceAnchor.targetId} commit=${state.pendingWorkspaceAnchor.commit}`,
         state,
       );
-      state.pendingConversationOnlyNavigation = undefined;
+      state.pendingWorkspaceAnchor = undefined;
     }
     await logLine(
       ctx,
@@ -2695,8 +2710,9 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
           "conversation-only navigation",
           state,
         );
-        state.pendingConversationOnlyNavigation = {
+        state.pendingWorkspaceAnchor = {
           commit,
+          label: "conversation-only navigation",
           oldLeafId: event.preparation.oldLeafId,
           targetId: event.preparation.targetId,
         };
@@ -2742,6 +2758,24 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
         return cancelNavigation("This history node's workspace snapshot is no longer available. Navigation cancelled.");
       }
       await restoreResolvedSnapshot(pi, ctx, state.internalNavigation ?? "tree", event.preparation.targetId, snapshotData, state);
+      const resultLeafId = getTreeNavigationResultLeafId(ctx, event.preparation.targetId);
+      const resultSnapshot = resultLeafId
+        ? resolveSnapshotForTreeTarget(ctx, resultLeafId, state)
+        : undefined;
+      const resultSnapshotData = getResolvedSnapshotData(resultSnapshot);
+      if (resultSnapshotData?.commit !== snapshotData.commit) {
+        state.pendingWorkspaceAnchor = {
+          commit: snapshotData.commit,
+          label: "restored workspace navigation",
+          oldLeafId: event.preparation.oldLeafId,
+          targetId: event.preparation.targetId,
+        };
+        await logLine(
+          ctx,
+          `preserve divergent restored workspace target=${event.preparation.targetId} resultLeaf=${String(resultLeafId)} commit=${snapshotData.commit}`,
+          state,
+        );
+      }
     } catch (error) {
       await logLine(
         ctx,
@@ -2756,29 +2790,29 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
 
   pi.on("session_tree", async (event, ctx) => {
     const state = getState(ctx);
-    const pendingNavigation = state.pendingConversationOnlyNavigation;
-    state.pendingConversationOnlyNavigation = undefined;
+    const pendingAnchor = state.pendingWorkspaceAnchor;
+    state.pendingWorkspaceAnchor = undefined;
     if (!await ensureWorkspaceHistoryAvailable(ctx, state, "session_tree")) {
       return;
     }
-    if (pendingNavigation && pendingNavigation.oldLeafId === event.oldLeafId) {
-      const commit = pendingNavigation.commit;
+    if (pendingAnchor && pendingAnchor.oldLeafId === event.oldLeafId) {
+      const commit = pendingAnchor.commit;
       pi.appendEntry<WorkspaceSnapshot>(SNAPSHOT_TYPE, {
         v: 1,
         kind: "manual",
         commit,
-        label: "conversation-only navigation",
+        label: pendingAnchor.label,
         createdAt: new Date().toISOString(),
       });
       await logLine(
         ctx,
-        `anchor conversation-only workspace target=${pendingNavigation.targetId} commit=${commit}`,
+        `anchor workspace target=${pendingAnchor.targetId} commit=${commit} label=${pendingAnchor.label}`,
         state,
       );
-    } else if (pendingNavigation) {
+    } else if (pendingAnchor) {
       await logLine(
         ctx,
-        `skip stale conversation-only anchor target=${pendingNavigation.targetId} commit=${pendingNavigation.commit}`,
+        `skip stale workspace anchor target=${pendingAnchor.targetId} commit=${pendingAnchor.commit}`,
         state,
       );
     }
@@ -2851,7 +2885,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
         state.internalNavigation = undefined;
         state.internalNavigationFailureReported = undefined;
         state.navigationMode = undefined;
-        state.pendingConversationOnlyNavigation = undefined;
+        state.pendingWorkspaceAnchor = undefined;
       }
     },
   });
@@ -2909,7 +2943,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
         state.internalNavigation = undefined;
         state.internalNavigationFailureReported = undefined;
         state.navigationMode = undefined;
-        state.pendingConversationOnlyNavigation = undefined;
+        state.pendingWorkspaceAnchor = undefined;
       }
     },
   });
