@@ -5,7 +5,7 @@ import type {
   ExtensionContext,
   SessionEntry,
   SessionMessageEntry,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 import {
   access,
   appendFile,

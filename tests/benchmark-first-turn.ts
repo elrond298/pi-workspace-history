@@ -2,19 +2,18 @@ import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import {
-  AuthStorage,
   createAgentSession,
   DefaultResourceLoader,
   getAgentDir,
-  ModelRegistry,
+  ModelRuntime,
   SessionManager,
   SettingsManager,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 import {
+  fauxProvider,
   fauxAssistantMessage,
   fauxToolCall,
-  registerFauxProvider,
-} from "@mariozechner/pi-ai";
+} from "@earendil-works/pi-ai";
 
 async function createWorkspace(rootDir: string, fileCount: number, fileSize: number): Promise<string> {
   const cwd = path.join(rootDir, "workspace");
@@ -36,15 +35,13 @@ async function main(): Promise<void> {
   const fileSize = Number(process.argv[3] ?? 256);
   const rootDir = await mkdtemp(path.join(os.tmpdir(), "pi-workspace-history-bench-"));
 
-  const authStorage = AuthStorage.inMemory();
-  const modelRegistry = ModelRegistry.inMemory(authStorage);
   const settingsManager = SettingsManager.inMemory({
     compaction: { enabled: false },
     retry: { enabled: false, maxRetries: 0 },
     branchSummary: { skipPrompt: true },
   });
 
-  const provider = registerFauxProvider({
+  const provider = fauxProvider({
     provider: "timemachine-bench",
     api: "faux",
     models: [
@@ -63,23 +60,11 @@ async function main(): Promise<void> {
   try {
     const cwd = await createWorkspace(rootDir, fileCount, fileSize);
 
-    modelRegistry.registerProvider("timemachine-bench", {
-      api: "faux",
-      apiKey: "TIMEMACHINE_BENCH_KEY",
-      baseUrl: "http://localhost:0",
-      models: [
-        {
-          id: "faux-1",
-          name: "Timemachine Bench Model",
-          reasoning: false,
-          input: ["text"],
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          contextWindow: 32000,
-          maxTokens: 4096,
-        },
-      ],
+    const modelRuntime = await ModelRuntime.create({
+      modelsPath: null,
+      refreshOnCreate: false,
     });
-    authStorage.setRuntimeApiKey("timemachine-bench", "test-key");
+    modelRuntime.registerNativeProvider(provider.provider);
 
     const resourceLoader = new DefaultResourceLoader({
       cwd,
@@ -99,8 +84,7 @@ async function main(): Promise<void> {
       agentDir: getAgentDir(),
       model,
       thinkingLevel: "off",
-      authStorage,
-      modelRegistry,
+      modelRuntime,
       resourceLoader,
       tools: ["read", "write", "edit"],
       sessionManager: SessionManager.inMemory(cwd),
@@ -154,7 +138,6 @@ async function main(): Promise<void> {
 
     session.dispose();
   } finally {
-    provider.unregister();
     await rm(rootDir, { recursive: true, force: true });
   }
 }

@@ -6,33 +6,31 @@ import { createHash } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import {
-  AuthStorage,
   type CustomEntry,
   createAgentSession,
   DefaultResourceLoader,
   getAgentDir,
-  ModelRegistry,
+  ModelRuntime,
   SessionManager,
   SettingsManager,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 import workspaceHistoryExtension, {
   rebuildTurnSnapshotsFromLegacyEntries,
   isWindowsReservedSnapshotPath,
 } from "../.pi/extensions/workspace-history.ts";
 import {
+  fauxProvider,
   fauxAssistantMessage,
   fauxToolCall,
-  registerFauxProvider,
-} from "@mariozechner/pi-ai";
+} from "@earendil-works/pi-ai";
 
 type TestContext = {
   rootDir: string;
   cwd: string;
   resourceLoader: DefaultResourceLoader;
-  modelRegistry: ModelRegistry;
-  authStorage: AuthStorage;
+  modelRuntime: ModelRuntime;
   settingsManager: SettingsManager;
-  provider: ReturnType<typeof registerFauxProvider>;
+  provider: ReturnType<typeof fauxProvider> & { unregister(): void };
 };
 
 type TurnSnapshotState = {
@@ -50,47 +48,36 @@ type TurnSnapshotState = {
 const execFileAsync = promisify(execFile);
 
 async function createContextForWorkspace(rootDir: string, cwd: string, withProjectMarker = true): Promise<TestContext> {
-  const authStorage = AuthStorage.inMemory();
-  const modelRegistry = ModelRegistry.inMemory(authStorage);
   const settingsManager = SettingsManager.inMemory({
     compaction: { enabled: false },
     retry: { enabled: false, maxRetries: 0 },
     branchSummary: { skipPrompt: true },
   });
 
-  const provider = registerFauxProvider({
-    provider: "timemachine-test",
-    api: "faux",
-    models: [
-      {
-        id: "faux-1",
-        name: "Timemachine Test Model",
-        reasoning: false,
-        input: ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 32000,
-        maxTokens: 4096,
-      },
-    ],
-  });
+  const provider = Object.assign(
+    fauxProvider({
+      provider: "timemachine-test",
+      api: "faux",
+      models: [
+        {
+          id: "faux-1",
+          name: "Timemachine Test Model",
+          reasoning: false,
+          input: ["text"],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: 32000,
+          maxTokens: 4096,
+        },
+      ],
+    }),
+    { unregister(): void {} },
+  );
 
-  modelRegistry.registerProvider("timemachine-test", {
-    api: "faux",
-    apiKey: "TIMEMACHINE_TEST_KEY",
-    baseUrl: "http://localhost:0",
-    models: [
-      {
-        id: "faux-1",
-        name: "Timemachine Test Model",
-        reasoning: false,
-        input: ["text"],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 32000,
-        maxTokens: 4096,
-      },
-    ],
+  const modelRuntime = await ModelRuntime.create({
+    modelsPath: null,
+    refreshOnCreate: false,
   });
-  authStorage.setRuntimeApiKey("timemachine-test", "test-key");
+  modelRuntime.registerNativeProvider(provider.provider);
 
   const resourceLoader = new DefaultResourceLoader({
     cwd,
@@ -118,8 +105,7 @@ async function createContextForWorkspace(rootDir: string, cwd: string, withProje
     rootDir,
     cwd,
     resourceLoader,
-    modelRegistry,
-    authStorage,
+    modelRuntime,
     settingsManager,
     provider,
   };
@@ -140,7 +126,6 @@ async function createNonProjectContext(): Promise<TestContext> {
 }
 
 async function disposeContext(ctx: TestContext): Promise<void> {
-  ctx.provider.unregister();
   for (let attempt = 0; attempt < 5; attempt += 1) {
     try {
       await rm(ctx.rootDir, { recursive: true, force: true });
@@ -161,8 +146,7 @@ async function createSession(ctx: TestContext, sessionManager: SessionManager = 
     agentDir: getAgentDir(),
     model,
     thinkingLevel: "off",
-    authStorage: ctx.authStorage,
-    modelRegistry: ctx.modelRegistry,
+    modelRuntime: ctx.modelRuntime,
     resourceLoader: ctx.resourceLoader,
     tools: ["read", "write", "edit"],
     sessionManager,
@@ -795,9 +779,12 @@ async function testCancelledConversationOnlySummaryDoesNotLeakAnchor(): Promise<
 
     const summaryNavigation = session.navigateTree(aAssistant.id, { summarize: true });
     session.abortBranchSummary();
-    const summaryResult = await summaryNavigation;
+    await assert.rejects(
+      summaryNavigation,
+      /Branch summarization failed: This operation was aborted/,
+      "summary navigation should report the abort",
+    );
 
-    assert.equal(summaryResult.aborted, true, "summary navigation should report the abort");
     assert.equal(session.sessionManager.getLeafId(), leafBeforeSummary, "an aborted summary should keep the conversation leaf");
     assert.equal(normalizeEol(await readText(filePath)), "B\n", "an aborted summary should keep the workspace");
 
