@@ -288,6 +288,8 @@ async function holdWindowsFileWithoutDeleteSharing(
   const child = spawn(powershellExe, [
     "-NoLogo",
     "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
     "-File",
     scriptPath,
     filePath,
@@ -1544,6 +1546,121 @@ async function testNewSessionReusesWorkspaceShadowRepo(): Promise<void> {
     ctx2.provider.unregister();
   } finally {
     await disposeContext(ctx1);
+  }
+}
+
+async function testRetentionCleanupRequiresValidMetadata(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    await writeWorkspaceHistorySettings(ctx, {
+      storageDir: getWorkspaceHistoryStateDir(ctx.rootDir),
+      maxSessionsPerWorkspace: 2,
+      maxWorkspaces: 2,
+    });
+    const storageDir = getWorkspaceHistoryStateDir(ctx.rootDir);
+    const workspaceHash = createHash("sha256").update(path.normalize(ctx.cwd)).digest("hex").slice(0, 24);
+    const workspaceRoot = path.join(storageDir, "workspaces", workspaceHash);
+    const sessionsRoot = path.join(workspaceRoot, "sessions");
+
+    const writeSessionMeta = async (sessionId: string, timestamp: string): Promise<string> => {
+      const sessionRoot = path.join(sessionsRoot, sessionId);
+      await mkdir(sessionRoot, { recursive: true });
+      await writeFile(path.join(sessionRoot, "meta.json"), `${JSON.stringify({
+        version: 1,
+        sessionId,
+        createdAt: timestamp,
+        lastUsedAt: timestamp,
+      })}\n`, "utf8");
+      return sessionRoot;
+    };
+    const newestSession = await writeSessionMeta("valid-newest", "2026-08-30T00:00:00.000Z");
+    const middleSession = await writeSessionMeta("valid-middle", "2026-08-15T00:00:00.000Z");
+    const oldestSession = await writeSessionMeta("valid-oldest", "2026-08-01T00:00:00.000Z");
+    const corruptSession = path.join(sessionsRoot, "corrupt-session");
+    await mkdir(corruptSession, { recursive: true });
+    await writeFile(path.join(corruptSession, "meta.json"), "{broken\n", "utf8");
+
+    const writeWorkspaceMeta = async (id: string, timestamp: string): Promise<string> => {
+      const root = path.join(storageDir, "workspaces", id);
+      await mkdir(root, { recursive: true });
+      await writeFile(path.join(root, "meta.json"), `${JSON.stringify({
+        version: 1,
+        workspaceHash: id,
+        cwd: path.join(ctx.rootDir, id),
+        realpath: path.join(ctx.rootDir, id),
+        createdAt: timestamp,
+        lastUsedAt: timestamp,
+      })}\n`, "utf8");
+      return root;
+    };
+    const newestWorkspace = await writeWorkspaceMeta("valid-workspace-newest", "2026-08-30T00:00:00.000Z");
+    const middleWorkspace = await writeWorkspaceMeta("valid-workspace-middle", "2026-08-15T00:00:00.000Z");
+    const oldestWorkspace = await writeWorkspaceMeta("valid-workspace-oldest", "2026-08-01T00:00:00.000Z");
+    const corruptWorkspace = path.join(storageDir, "workspaces", "corrupt-workspace");
+    await mkdir(corruptWorkspace, { recursive: true });
+    await writeFile(path.join(corruptWorkspace, "meta.json"), "[]\n", "utf8");
+
+    const session = await createSession(ctx);
+    await waitForExists(middleSession, false, "cleanup should delete the middle valid session over the limit");
+    await waitForExists(oldestSession, false, "cleanup should delete the oldest valid session");
+    await waitForExists(middleWorkspace, false, "cleanup should delete the middle valid workspace over the limit");
+    await waitForExists(oldestWorkspace, false, "cleanup should delete the oldest valid workspace");
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    assert.equal(await pathExists(newestSession), true, "cleanup should keep the newest valid session");
+    assert.equal(await pathExists(corruptSession), true, "cleanup should conservatively keep a session with corrupt metadata");
+    assert.equal(await pathExists(newestWorkspace), true, "cleanup should keep the newest valid workspace");
+    assert.equal(await pathExists(corruptWorkspace), true, "cleanup should conservatively keep a workspace with corrupt metadata");
+    assert.equal(await pathExists(getSessionHistoryDir(session, ctx.cwd)), true, "cleanup must keep the current session");
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
+async function testRetentionCleanupLogsDeletionFailure(): Promise<void> {
+  if (process.platform !== "win32") {
+    return;
+  }
+  const ctx = await createContext();
+  let releaseLock: (() => Promise<void>) | undefined;
+  const previousLogging = process.env.PI_WORKSPACE_HISTORY_LOG;
+  try {
+    process.env.PI_WORKSPACE_HISTORY_LOG = "1";
+    await writeWorkspaceHistorySettings(ctx, {
+      storageDir: getWorkspaceHistoryStateDir(ctx.rootDir),
+      maxSessionsPerWorkspace: 1,
+    });
+    const workspaceHash = createHash("sha256").update(path.normalize(ctx.cwd)).digest("hex").slice(0, 24);
+    const oldSessionRoot = path.join(
+      getWorkspaceHistoryStateDir(ctx.rootDir),
+      "workspaces",
+      workspaceHash,
+      "sessions",
+      "locked-old-session",
+    );
+    await mkdir(oldSessionRoot, { recursive: true });
+    await writeFile(path.join(oldSessionRoot, "meta.json"), `${JSON.stringify({
+      version: 1,
+      sessionId: "locked-old-session",
+      createdAt: "2026-08-01T00:00:00.000Z",
+      lastUsedAt: "2026-08-01T00:00:00.000Z",
+    })}\n`, "utf8");
+    const lockedPath = path.join(oldSessionRoot, "locked.txt");
+    await writeFile(lockedPath, "locked\n", "utf8");
+    releaseLock = await holdWindowsFileWithoutDeleteSharing(lockedPath, ctx.rootDir);
+
+    const session = await createSession(ctx);
+    const logPath = path.join(getWorkspaceHistoryStateDir(ctx.rootDir), "logs", "timemachine.log");
+    await waitFor(async () => {
+      const log = await readFile(logPath, "utf8").catch(() => "");
+      return log.includes("cleanup session failed") && log.includes("locked-old-session");
+    }, "cleanup deletion failure should be written to the workspace history log");
+    assert.equal(await pathExists(oldSessionRoot), true, "a failed cleanup must leave the session directory intact");
+    session.dispose();
+  } finally {
+    process.env.PI_WORKSPACE_HISTORY_LOG = previousLogging;
+    await releaseLock?.();
+    await disposeContext(ctx);
   }
 }
 
@@ -2858,6 +2975,8 @@ async function main(): Promise<void> {
     { name: "before commit reuses previous after commit when workspace unchanged", run: testBeforeCommitReusesPreviousAfterCommitWhenWorkspaceUnchanged },
     { name: ".pi files are managed except internal state", run: testPiFilesAreSnapshotManagedExceptInternalState },
     { name: "history is stored outside workspace", run: testHistoryIsStoredOutsideWorkspace },
+    { name: "retention cleanup requires valid metadata", run: testRetentionCleanupRequiresValidMetadata },
+    { name: "retention cleanup logs deletion failure", run: testRetentionCleanupLogsDeletionFailure },
     { name: "new session reuses workspace shadow repo", run: testNewSessionReusesWorkspaceShadowRepo },
     { name: "invalid current shadow repo is quarantined and rebuilt", run: testInvalidCurrentShadowRepoIsQuarantinedAndRebuilt },
     { name: "invalid reusable shadow repo is quarantined and rebuilt", run: testInvalidReusableShadowRepoIsQuarantinedAndRebuilt },

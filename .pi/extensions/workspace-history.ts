@@ -699,6 +699,34 @@ function notifyInvalidShadowRepoRecovery(ctx: ExtensionContext, state: RuntimeSt
   }
 }
 
+function isJsonRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isValidMetaTimestamp(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && Number.isFinite(Date.parse(value));
+}
+
+function isValidSessionMeta(value: unknown, sessionId: string): value is SessionMeta {
+  return isJsonRecord(value)
+    && value.version === 1
+    && value.sessionId === sessionId
+    && isValidMetaTimestamp(value.createdAt)
+    && isValidMetaTimestamp(value.lastUsedAt);
+}
+
+function isValidWorkspaceMeta(value: unknown, workspaceHash: string): value is WorkspaceMeta {
+  return isJsonRecord(value)
+    && value.version === 1
+    && value.workspaceHash === workspaceHash
+    && typeof value.cwd === "string"
+    && value.cwd.length > 0
+    && typeof value.realpath === "string"
+    && value.realpath.length > 0
+    && isValidMetaTimestamp(value.createdAt)
+    && isValidMetaTimestamp(value.lastUsedAt);
+}
+
 async function findReusableShadowGitDir(pi: ExtensionAPI, ctx: ExtensionContext, state?: RuntimeState): Promise<{ gitDir: string; shared: boolean } | undefined> {
   const paths = await ensureStorageDirs(ctx, state);
   const currentSessionId = ctx.sessionManager.getSessionId();
@@ -790,34 +818,54 @@ async function cleanupWorkspaceHistory(ctx: ExtensionContext, state?: RuntimeSta
   const currentSessionId = ctx.sessionManager.getSessionId();
 
   const sessionIds = await listSubdirectories(paths.sessionsRoot);
-  const sessionRecords = await Promise.all(sessionIds.map(async (sessionId) => {
+  const sessionRecords = (await Promise.all(sessionIds.map(async (sessionId) => {
     const sessionRoot = path.join(paths.sessionsRoot, sessionId);
-    const meta = await readJsonFile<SessionMeta>(path.join(sessionRoot, "meta.json"));
-    return { sessionId, sessionRoot, lastUsedAt: meta?.lastUsedAt ?? meta?.createdAt ?? "" };
-  }));
+    const meta = await readJsonFile<unknown>(path.join(sessionRoot, "meta.json"));
+    return isValidSessionMeta(meta, sessionId)
+      ? { sessionId, sessionRoot, lastUsedAt: meta.lastUsedAt }
+      : undefined;
+  }))).filter((record): record is NonNullable<typeof record> => record !== undefined);
 
   const removableSessions = sessionRecords
     .filter((record) => record.sessionId !== currentSessionId)
     .sort((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
 
   for (const record of removableSessions.slice(Math.max(0, settings.maxSessionsPerWorkspace - 1))) {
-    await fsRm(record.sessionRoot, { recursive: true, force: true }).catch(() => undefined);
+    try {
+      await fsRm(record.sessionRoot, { recursive: true, force: true });
+    } catch (error) {
+      await logLine(
+        ctx,
+        `cleanup session failed sessionId=${record.sessionId} path=${record.sessionRoot} error=${String(error)}`,
+        state,
+      ).catch(() => undefined);
+    }
   }
 
   const workspacesRoot = path.join(paths.storageDir, "workspaces");
   const workspaceIds = await listSubdirectories(workspacesRoot);
-  const workspaceRecords = await Promise.all(workspaceIds.map(async (workspaceId) => {
+  const workspaceRecords = (await Promise.all(workspaceIds.map(async (workspaceId) => {
     const workspaceRoot = path.join(workspacesRoot, workspaceId);
-    const meta = await readJsonFile<WorkspaceMeta>(path.join(workspaceRoot, "meta.json"));
-    return { workspaceId, workspaceRoot, lastUsedAt: meta?.lastUsedAt ?? meta?.createdAt ?? "" };
-  }));
+    const meta = await readJsonFile<unknown>(path.join(workspaceRoot, "meta.json"));
+    return isValidWorkspaceMeta(meta, workspaceId)
+      ? { workspaceId, workspaceRoot, lastUsedAt: meta.lastUsedAt }
+      : undefined;
+  }))).filter((record): record is NonNullable<typeof record> => record !== undefined);
 
   const removableWorkspaces = workspaceRecords
     .filter((record) => record.workspaceId !== paths.workspaceHash)
     .sort((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
 
   for (const record of removableWorkspaces.slice(Math.max(0, settings.maxWorkspaces - 1))) {
-    await fsRm(record.workspaceRoot, { recursive: true, force: true }).catch(() => undefined);
+    try {
+      await fsRm(record.workspaceRoot, { recursive: true, force: true });
+    } catch (error) {
+      await logLine(
+        ctx,
+        `cleanup workspace failed workspaceId=${record.workspaceId} path=${record.workspaceRoot} error=${String(error)}`,
+        state,
+      ).catch(() => undefined);
+    }
   }
 }
 
@@ -2336,7 +2384,9 @@ function scheduleCleanup(ctx: ExtensionContext, state?: RuntimeState): void {
   }
   state.lastCleanupAt = now;
   state.cleanupPromise = cleanupWorkspaceHistory(ctx, state)
-    .catch(() => undefined)
+    .catch(async (error) => {
+      await logLine(ctx, `cleanup failed error=${String(error)}`, state).catch(() => undefined);
+    })
     .finally(() => {
       state.cleanupPromise = undefined;
     });
