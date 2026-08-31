@@ -1377,6 +1377,42 @@ async function testLegacySnapshotEntriesRebuildTurnSnapshots(): Promise<void> {
   }
 }
 
+async function testLegacyUnanchoredIntermediateNodeCancelsNavigation(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    const session = await createSession(ctx);
+    captureNotifications(session);
+    const filePath = path.join(ctx.cwd, "legacy-intermediate.txt");
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "legacy-intermediate.txt", content: "first\n" })]),
+      fauxAssistantMessage([fauxToolCall("write", { path: "legacy-intermediate.txt", content: "second\n" })]),
+      fauxAssistantMessage("completed legacy intermediate operation"),
+    ]);
+
+    await session.prompt("create legacy-intermediate.txt twice");
+    await waitForText(filePath, "second\n", "the completed operation should contain the second tool result");
+    const firstToolResult = session.sessionManager.getEntries().find((entry) => {
+      return entry.type === "message" && entry.message.role === "toolResult";
+    });
+    assert.ok(firstToolResult, "the fixture should contain an intermediate tool result");
+
+    const legacySnapshots = structuredClone(await readTurnSnapshots(session, ctx.cwd));
+    for (const turn of legacySnapshots.turns) {
+      delete turn.navigationSnapshots;
+    }
+    await writeFile(getTurnSnapshotFile(session, ctx.cwd), `${JSON.stringify(legacySnapshots, null, 2)}\n`, "utf8");
+    await session.reload();
+    captureNotifications(session);
+
+    const navigation = await session.navigateTree(firstToolResult.id, { summarize: false });
+    assert.equal(navigation.cancelled, true, "legacy intermediate nodes without exact anchors must cancel navigation");
+    await waitForText(filePath, "second\n", "cancelled legacy navigation must leave the workspace unchanged");
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
 async function testWindowsReservedNamesAreExcludedFromSnapshotPaths(): Promise<void> {
   assert.equal(isWindowsReservedSnapshotPath("nul"), true, "nul should be treated as a reserved Windows device path");
   assert.equal(isWindowsReservedSnapshotPath("NUL.txt"), true, "nul with extension should be treated as reserved");
@@ -1625,7 +1661,7 @@ async function testRetentionCleanupLogsDeletionFailure(): Promise<void> {
   let releaseLock: (() => Promise<void>) | undefined;
   const previousLogging = process.env.PI_WORKSPACE_HISTORY_LOG;
   try {
-    process.env.PI_WORKSPACE_HISTORY_LOG = "1";
+    delete process.env.PI_WORKSPACE_HISTORY_LOG;
     await writeWorkspaceHistorySettings(ctx, {
       storageDir: getWorkspaceHistoryStateDir(ctx.rootDir),
       maxSessionsPerWorkspace: 1,
@@ -1658,7 +1694,11 @@ async function testRetentionCleanupLogsDeletionFailure(): Promise<void> {
     assert.equal(await pathExists(oldSessionRoot), true, "a failed cleanup must leave the session directory intact");
     session.dispose();
   } finally {
-    process.env.PI_WORKSPACE_HISTORY_LOG = previousLogging;
+    if (previousLogging === undefined) {
+      delete process.env.PI_WORKSPACE_HISTORY_LOG;
+    } else {
+      process.env.PI_WORKSPACE_HISTORY_LOG = previousLogging;
+    }
     await releaseLock?.();
     await disposeContext(ctx);
   }
@@ -1808,6 +1848,21 @@ async function testAutomaticCompactionContinuationStaysInOneUndoUnit(): Promise<
     assert.ok(
       compactedOperation?.navigationSnapshots?.some((anchor) => anchor.entryId === compactionEntry.id),
       "the compaction node should receive an exact workspace anchor",
+    );
+    const finalLeafId = session.sessionManager.getLeafId();
+    const navigateToCompaction = await session.navigateTree(compactionEntry.id, { summarize: false });
+    assert.equal(navigateToCompaction.cancelled, false, "navigating to the compaction node should succeed");
+    await waitForExists(
+      path.join(ctx.cwd, "compacted.txt"),
+      false,
+      "the compaction node should restore the state before continuation tool changes",
+    );
+    const navigateToFinalLeaf = await session.navigateTree(finalLeafId, { summarize: false });
+    assert.equal(navigateToFinalLeaf.cancelled, false, "navigating back to the completed operation should succeed");
+    await waitForText(
+      path.join(ctx.cwd, "compacted.txt"),
+      "compacted\n",
+      "the completed operation node should restore continuation tool changes",
     );
     await session.prompt("/undo");
     await waitForExists(path.join(ctx.cwd, "compacted.txt"), false, "undo should remove changes made before automatic compaction");
@@ -2971,6 +3026,7 @@ async function main(): Promise<void> {
     { name: "undo does not leak across sessions", run: testUndoDoesNotLeakAcrossSessions },
     { name: "undo works from tree-selected user node", run: testUndoWorksFromTreeSelectedUserNode },
     { name: "legacy snapshot entries rebuild turn snapshots", run: testLegacySnapshotEntriesRebuildTurnSnapshots },
+    { name: "legacy unanchored intermediate node cancels navigation", run: testLegacyUnanchoredIntermediateNodeCancelsNavigation },
     { name: "windows reserved names are excluded from snapshot paths", run: testWindowsReservedNamesAreExcludedFromSnapshotPaths },
     { name: "before commit reuses previous after commit when workspace unchanged", run: testBeforeCommitReusesPreviousAfterCommitWhenWorkspaceUnchanged },
     { name: ".pi files are managed except internal state", run: testPiFilesAreSnapshotManagedExceptInternalState },

@@ -838,6 +838,7 @@ async function cleanupWorkspaceHistory(ctx: ExtensionContext, state?: RuntimeSta
         ctx,
         `cleanup session failed sessionId=${record.sessionId} path=${record.sessionRoot} error=${String(error)}`,
         state,
+        true,
       ).catch(() => undefined);
     }
   }
@@ -864,6 +865,7 @@ async function cleanupWorkspaceHistory(ctx: ExtensionContext, state?: RuntimeSta
         ctx,
         `cleanup workspace failed workspaceId=${record.workspaceId} path=${record.workspaceRoot} error=${String(error)}`,
         state,
+        true,
       ).catch(() => undefined);
     }
   }
@@ -1002,8 +1004,13 @@ function parseNullSeparatedPaths(raw: string): string[] {
     .filter((line) => line.length > 0);
 }
 
-async function logLine(ctx: ExtensionContext, line: string, state?: RuntimeState): Promise<void> {
-  if (!isWorkspaceHistoryLoggingEnabled()) {
+async function logLine(
+  ctx: ExtensionContext,
+  line: string,
+  state?: RuntimeState,
+  required = false,
+): Promise<void> {
+  if (!required && !isWorkspaceHistoryLoggingEnabled()) {
     return;
   }
 
@@ -2188,7 +2195,7 @@ function findBeforeSnapshotForUserEntry(userEntryId: string, state?: RuntimeStat
   } : undefined;
 }
 
-function findNearestSnapshotOnChain(
+function findInheritedSnapshotForMetadataTarget(
   ctx: ExtensionContext,
   startId: string | null | undefined,
   state?: RuntimeState,
@@ -2205,6 +2212,22 @@ function findNearestSnapshotOnChain(
     const anchoredSnapshot = findNavigationSnapshotForEntry(entry.id, state);
     if (anchoredSnapshot) {
       return anchoredSnapshot;
+    }
+    if (entry.type === "message") {
+      if (entry.message.role !== "assistant") {
+        return undefined;
+      }
+      const turn = findTurnSnapshotByAssistantEntryId(entry.id, state);
+      return turn ? {
+        v: 1,
+        kind: "after",
+        commit: turn.afterCommit,
+        turnId: turn.turnId,
+        promptText: turn.promptText,
+        userEntryId: turn.userEntryId,
+        assistantEntryId: turn.assistantEntryId,
+        createdAt: turn.createdAt,
+      } : undefined;
     }
     currentId = entry.parentId;
   }
@@ -2230,15 +2253,14 @@ function resolveSnapshotForTreeTarget(
     return anchoredSnapshot;
   }
 
-  if (isUserMessageEntry(target)) {
-    return findBeforeSnapshotForUserEntry(target.id, state) ?? findNearestSnapshotOnChain(ctx, target.parentId, state);
+  if (target.type === "message") {
+    if (target.message.role === "user") {
+      return findBeforeSnapshotForUserEntry(target.id, state);
+    }
+    return findAfterSnapshotForMessageAnchor(ctx, target, state);
   }
 
-  if (target.type === "custom_message") {
-    return findNearestSnapshotOnChain(ctx, target.parentId, state);
-  }
-
-  return findAfterSnapshotForMessageAnchor(ctx, target, state) ?? findNearestSnapshotOnChain(ctx, targetId, state);
+  return findInheritedSnapshotForMetadataTarget(ctx, target.parentId, state);
 }
 
 async function ensureBaselineSnapshot(
@@ -2385,7 +2407,7 @@ function scheduleCleanup(ctx: ExtensionContext, state?: RuntimeState): void {
   state.lastCleanupAt = now;
   state.cleanupPromise = cleanupWorkspaceHistory(ctx, state)
     .catch(async (error) => {
-      await logLine(ctx, `cleanup failed error=${String(error)}`, state).catch(() => undefined);
+      await logLine(ctx, `cleanup failed error=${String(error)}`, state, true).catch(() => undefined);
     })
     .finally(() => {
       state.cleanupPromise = undefined;
@@ -2680,6 +2702,23 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     return startIndex >= 0 ? branch.slice(startIndex + 1) : branch;
   }
 
+  function anchorPendingOperationEntry(
+    state: RuntimeState,
+    entryId: string,
+    commit: string,
+    position: "before" | "after",
+  ): void {
+    const anchors = state.pendingNavigationSnapshots ?? [];
+    const anchoredEntryIds = state.pendingAnchoredEntryIds ?? new Set(anchors.map((anchor) => anchor.entryId));
+    if (anchoredEntryIds.has(entryId)) {
+      return;
+    }
+    anchors.push({ entryId, commit, position });
+    anchoredEntryIds.add(entryId);
+    state.pendingNavigationSnapshots = anchors;
+    state.pendingAnchoredEntryIds = anchoredEntryIds;
+  }
+
   async function capturePendingAgentOperation(
     ctx: ExtensionContext,
     state: RuntimeState,
@@ -2719,24 +2758,18 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       commit = await createSnapshotCommit(pi, ctx, `after ${state.pendingTurnId}`, state, true);
     }
 
-    const anchors = state.pendingNavigationSnapshots ?? [];
-    const anchoredEntryIds = state.pendingAnchoredEntryIds ?? new Set(anchors.map((anchor) => anchor.entryId));
     for (const entry of operationEntries) {
-      if (anchoredEntryIds.has(entry.id)) {
-        continue;
-      }
       const isOriginalUser = entry.id === originalUserEntry.id;
       const isQueuedUser = isUserMessageEntry(entry) && !isOriginalUser;
-      anchors.push({
-        entryId: entry.id,
-        commit: isOriginalUser ? state.pendingBeforeCommit : isQueuedUser ? previousCommit : commit,
-        position: isOriginalUser || isQueuedUser ? "before" : "after",
-      });
-      anchoredEntryIds.add(entry.id);
+      anchorPendingOperationEntry(
+        state,
+        entry.id,
+        isOriginalUser ? state.pendingBeforeCommit : isQueuedUser ? previousCommit : commit,
+        isOriginalUser || isQueuedUser ? "before" : "after",
+      );
     }
-    state.pendingNavigationSnapshots = anchors;
-    state.pendingAnchoredEntryIds = anchoredEntryIds;
     state.pendingLastTurnCommit = commit;
+    const anchors = state.pendingNavigationSnapshots ?? [];
 
     const snapshots = await readTurnSnapshotState(ctx, state);
     const existingIndex = snapshots.turns.findIndex((entry) => entry.turnId === state.pendingTurnId);
@@ -2890,6 +2923,35 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       await capturePendingAgentOperation(ctx, state, "turn_end");
     } catch (error) {
       await logLine(ctx, `after snapshot failed error=${String(error)}`, state);
+      throw error;
+    }
+  });
+
+  pi.on("session_compact", async (event, ctx) => {
+    const state = getState(ctx);
+    if (!state.pendingTurnId || !state.pendingBeforeCommit) {
+      return;
+    }
+    try {
+      if (!await ensureWorkspaceHistoryAvailable(ctx, state, "session_compact")) {
+        return;
+      }
+      const commit = state.pendingLastTurnCommit ?? state.pendingBeforeCommit;
+      anchorPendingOperationEntry(state, event.compactionEntry.id, commit, "after");
+
+      const snapshots = await readTurnSnapshotState(ctx, state);
+      const existing = snapshots.turns.find((turn) => turn.turnId === state.pendingTurnId);
+      if (existing) {
+        existing.navigationSnapshots = [...(state.pendingNavigationSnapshots ?? [])];
+        await writeTurnSnapshotState(ctx, snapshots, state);
+      }
+      await logLine(
+        ctx,
+        `capture compaction anchor turn=${state.pendingTurnId} entry=${event.compactionEntry.id} commit=${commit}`,
+        state,
+      );
+    } catch (error) {
+      await logLine(ctx, `compaction anchor failed error=${String(error)}`, state);
       throw error;
     }
   });
