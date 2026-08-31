@@ -43,6 +43,11 @@ type TurnSnapshotState = {
     beforeCommit: string;
     afterCommit: string;
     createdAt: string;
+    navigationSnapshots?: Array<{
+      entryId: string;
+      commit: string;
+      position: "before" | "after";
+    }>;
   }>;
 };
 
@@ -1542,6 +1547,270 @@ async function testNewSessionReusesWorkspaceShadowRepo(): Promise<void> {
   }
 }
 
+async function testRepeatedUndoRedoSurvivesReloadAndFailures(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    const session = await createSession(ctx);
+    captureNotifications(session);
+    const filePath = path.join(ctx.cwd, "redo-chain.txt");
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "redo-chain.txt", content: "A\n" })]),
+      fauxAssistantMessage("created A"),
+      fauxAssistantMessage([fauxToolCall("write", { path: "redo-chain.txt", content: "B\n" })]),
+      fauxAssistantMessage("created B"),
+      fauxAssistantMessage([fauxToolCall("write", { path: "redo-chain.txt", content: "C\n" })]),
+      fauxAssistantMessage("created C"),
+    ]);
+    await session.prompt("create redo state A");
+    await session.prompt("create redo state B");
+    await session.prompt("create redo state C");
+
+    await session.prompt("/undo");
+    await waitForText(filePath, "B\n", "first undo should restore B");
+    await session.prompt("/undo");
+    await waitForText(filePath, "A\n", "second undo should restore A");
+
+    await session.reload();
+    captureNotifications(session);
+    await session.prompt("/redo");
+    await waitForText(filePath, "B\n", "redo should survive extension reload");
+    await session.prompt("/redo");
+    await waitForText(filePath, "C\n", "second redo should restore C");
+
+    await session.prompt("/undo");
+    await waitForText(filePath, "B\n", "undo should recreate a redo target for C");
+    const leafBeforeBlockedRedo = session.sessionManager.getLeafId();
+    await writeFile(filePath, "manual\n", "utf8");
+    await session.prompt("/redo");
+    assert.equal(session.sessionManager.getLeafId(), leafBeforeBlockedRedo, "a blocked redo should not navigate");
+    assert.equal(normalizeEol(await readText(filePath)), "manual\n", "a blocked redo should preserve manual edits");
+
+    await writeFile(filePath, "B\n", "utf8");
+    await session.prompt("/redo");
+    await waitForText(filePath, "C\n", "a failed redo must remain available for retry");
+
+    await session.prompt("/undo");
+    await waitForText(filePath, "B\n", "undo should restore B before creating a new branch");
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "redo-chain.txt", content: "D\n" })]),
+      fauxAssistantMessage("created D"),
+    ]);
+    await session.prompt("create a new D branch");
+    await waitForText(filePath, "D\n", "new branch should create D");
+    const leafBeforeEmptyRedo = session.sessionManager.getLeafId();
+    await session.prompt("/redo");
+    assert.equal(session.sessionManager.getLeafId(), leafBeforeEmptyRedo, "a new agent operation should clear the old redo stack");
+    assert.equal(normalizeEol(await readText(filePath)), "D\n");
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
+async function testMultiRoundToolCallsFormOneUndoUnit(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    const session = await createSession(ctx);
+    captureNotifications(session);
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "round-one.txt", content: "one\n" })]),
+      fauxAssistantMessage([fauxToolCall("write", { path: "round-two.txt", content: "two\n" })]),
+      fauxAssistantMessage([fauxToolCall("write", { path: "round-three.txt", content: "three\n" })]),
+      fauxAssistantMessage("all rounds complete"),
+    ]);
+
+    await session.prompt("create three files across multiple tool rounds");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") === 1, "multi-round operation snapshot was not created");
+    await session.prompt("/undo");
+
+    await waitForExists(path.join(ctx.cwd, "round-one.txt"), false, "undo should remove the first tool round");
+    await waitForExists(path.join(ctx.cwd, "round-two.txt"), false, "undo should remove the second tool round");
+    await waitForExists(path.join(ctx.cwd, "round-three.txt"), false, "undo should remove the third tool round");
+
+    await session.prompt("/redo");
+    await waitForText(path.join(ctx.cwd, "round-one.txt"), "one\n", "redo should restore the first tool round");
+    await waitForText(path.join(ctx.cwd, "round-two.txt"), "two\n", "redo should restore the second tool round");
+    await waitForText(path.join(ctx.cwd, "round-three.txt"), "three\n", "redo should restore the third tool round");
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
+async function testAutomaticRetryStaysInOneUndoUnit(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    ctx.settingsManager.applyOverrides({
+      retry: { enabled: true, maxRetries: 1, baseDelayMs: 1 },
+    });
+    const session = await createSession(ctx);
+    captureNotifications(session);
+    ctx.provider.setResponses([
+      fauxAssistantMessage("temporary failure", { stopReason: "error", errorMessage: "temporary failure" }),
+      fauxAssistantMessage([fauxToolCall("write", { path: "retried.txt", content: "retried\n" })]),
+      fauxAssistantMessage("retry complete"),
+    ]);
+
+    await session.prompt("create retried.txt after an automatic retry");
+    const snapshots = await readTurnSnapshots(session, ctx.cwd);
+    assert.equal(snapshots.turns.length, 1, "automatic retry should remain in the original undo unit");
+    await session.prompt("/undo");
+    await waitForExists(path.join(ctx.cwd, "retried.txt"), false, "undo should remove the successful retry result");
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
+async function testAutomaticCompactionContinuationStaysInOneUndoUnit(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    ctx.settingsManager.applyOverrides({
+      compaction: { enabled: true, reserveTokens: 16_000, keepRecentTokens: 100 },
+    });
+    const session = await createSession(ctx);
+    captureNotifications(session);
+    ctx.provider.setResponses([
+      fauxAssistantMessage("setup complete"),
+    ]);
+    await session.prompt("establish an older turn before compaction");
+
+    ctx.provider.setResponses([
+      fauxAssistantMessage("truncated", { stopReason: "length" }),
+      fauxAssistantMessage("Compacted the test operation."),
+      fauxAssistantMessage([fauxToolCall("write", { path: "compacted.txt", content: "compacted\n" })]),
+      fauxAssistantMessage("created compacted file"),
+    ]);
+
+    await session.prompt(`create compacted.txt\n${"context ".repeat(5_000)}`);
+    const compactionEntry = session.sessionManager.getEntries().find((entry) => entry.type === "compaction");
+    assert.ok(compactionEntry, "the fixture should trigger automatic threshold compaction");
+    const snapshots = await readTurnSnapshots(session, ctx.cwd);
+    assert.equal(snapshots.turns.length, 2, "automatic compaction should not split the compacted operation");
+    const compactedOperation = snapshots.turns[1];
+    assert.ok(
+      compactedOperation?.navigationSnapshots?.some((anchor) => anchor.entryId === compactionEntry.id),
+      "the compaction node should receive an exact workspace anchor",
+    );
+    await session.prompt("/undo");
+    await waitForExists(path.join(ctx.cwd, "compacted.txt"), false, "undo should remove changes made before automatic compaction");
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
+async function testQueuedInputsPreserveOperationAndIntermediateAnchors(): Promise<void> {
+  const ctx = await createContext();
+  let releaseFirstResponse: (() => void) | undefined;
+  try {
+    const session = await createSession(ctx);
+    captureNotifications(session);
+    const firstResponseGate = new Promise<void>((resolve) => {
+      releaseFirstResponse = resolve;
+    });
+    ctx.provider.setResponses([
+      async () => {
+        await firstResponseGate;
+        return fauxAssistantMessage([fauxToolCall("write", { path: "primary.txt", content: "primary\n" })]);
+      },
+      fauxAssistantMessage([fauxToolCall("write", { path: "steered.txt", content: "steered\n" })]),
+      fauxAssistantMessage("steering complete"),
+      fauxAssistantMessage([fauxToolCall("write", { path: "follow-up.txt", content: "follow-up\n" })]),
+      fauxAssistantMessage("follow-up complete"),
+    ]);
+
+    const operation = session.prompt("run the primary operation");
+    await waitFor(() => ctx.provider.state.callCount >= 1, "primary response did not start");
+    await session.prompt("also create steered.txt", { streamingBehavior: "steer" });
+    await session.prompt("then create follow-up.txt", { streamingBehavior: "followUp" });
+    releaseFirstResponse?.();
+    await operation;
+    await session.agent.waitForIdle();
+
+    const snapshots = await readTurnSnapshots(session, ctx.cwd);
+    assert.equal(snapshots.turns.length, 1, "queued inputs should remain one undo unit");
+    const operationSnapshot = snapshots.turns[0];
+    assert.equal(operationSnapshot?.promptText, "run the primary operation", "queued input must not overwrite the original prompt");
+    const originalUserEntry = operationSnapshot
+      ? session.sessionManager.getEntry(operationSnapshot.userEntryId)
+      : undefined;
+    assert.equal(getMessageText(originalUserEntry), "run the primary operation", "the operation should retain its original user node");
+
+    await session.prompt("/undo");
+    await waitForExists(path.join(ctx.cwd, "primary.txt"), false, "queued operation undo should remove the primary change");
+    await waitForExists(path.join(ctx.cwd, "steered.txt"), false, "queued operation undo should remove the steered change");
+    await waitForExists(path.join(ctx.cwd, "follow-up.txt"), false, "queued operation undo should remove the follow-up change");
+    await session.prompt("/redo");
+    await waitForText(path.join(ctx.cwd, "primary.txt"), "primary\n", "queued operation redo should restore the primary change");
+    await waitForText(path.join(ctx.cwd, "steered.txt"), "steered\n", "queued operation redo should restore the steered change");
+    await waitForText(path.join(ctx.cwd, "follow-up.txt"), "follow-up\n", "queued operation redo should restore the follow-up change");
+
+    const firstToolResult = session.sessionManager.getEntries().find((entry) => {
+      return entry.type === "message" && entry.message.role === "toolResult";
+    });
+    assert.ok(firstToolResult, "the primary tool result should exist in the session tree");
+    const navigation = await session.navigateTree(firstToolResult.id, { summarize: false });
+    assert.equal(navigation.cancelled, false, "an intermediate tool-result node should have an exact workspace anchor");
+    await waitForText(path.join(ctx.cwd, "primary.txt"), "primary\n", "the primary tool state should be restored");
+    await waitForExists(path.join(ctx.cwd, "steered.txt"), false, "the intermediate anchor should predate steering changes");
+    await waitForExists(path.join(ctx.cwd, "follow-up.txt"), false, "the intermediate anchor should predate follow-up changes");
+    session.dispose();
+  } finally {
+    releaseFirstResponse?.();
+    await disposeContext(ctx);
+  }
+}
+
+async function testMetadataTreeNodesInheritSemanticWorkspaceAnchor(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    const session = await createSession(ctx);
+    captureNotifications(session);
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "metadata-state.txt", content: "state\n" })]),
+      fauxAssistantMessage("created metadata state"),
+    ]);
+    await session.prompt("create metadata state");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") === 1, "metadata fixture snapshot was not created");
+
+    const anchoredAssistant = [...session.sessionManager.getBranch()].reverse().find((entry) => {
+      return entry.type === "message" && entry.message.role === "assistant";
+    });
+    assert.ok(anchoredAssistant, "the metadata fixture assistant should exist");
+    const customMessageId = session.sessionManager.appendCustomMessageEntry("test.metadata", "custom metadata", true);
+    const thinkingLevelId = session.sessionManager.appendThinkingLevelChange("medium");
+    const compactionId = session.sessionManager.appendCompaction(
+      "test compaction",
+      session.sessionManager.getBranch().find((entry) => entry.type === "message" && entry.message.role === "user")?.id ?? "",
+      10,
+    );
+    const branchSummaryId = session.sessionManager.branchWithSummary(
+      anchoredAssistant.id,
+      "test branch summary",
+    );
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "metadata-state.txt", content: "later\n" })]),
+      fauxAssistantMessage("updated metadata state"),
+    ]);
+    await session.prompt("update metadata state");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") === 2, "later metadata snapshot was not created");
+
+    for (const targetId of [customMessageId, thinkingLevelId, compactionId, branchSummaryId]) {
+      const navigation = await session.navigateTree(targetId, { summarize: false });
+      assert.equal(navigation.cancelled, false, "metadata nodes should inherit the nearest semantic anchor");
+      await waitForText(
+        path.join(ctx.cwd, "metadata-state.txt"),
+        "state\n",
+        `metadata navigation should preserve the anchored workspace for ${targetId}`,
+      );
+    }
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
 async function testInternalStorageDirDisablesExtension(): Promise<void> {
   const ctx = await createContext();
   try {
@@ -2571,8 +2840,14 @@ async function main(): Promise<void> {
     { name: "conversation-only navigation recovers pending workspace before anchoring", run: testConversationOnlyNavigationRecoversPendingWorkspaceBeforeAnchoring },
     { name: "conversation-only navigation preserves edits after pending recovery", run: testConversationOnlyNavigationPreservesEditsAfterPendingRecovery },
     { name: "undo/redo restores workspace", run: testUndoRedo },
+    { name: "multi-round tool calls form one undo unit", run: testMultiRoundToolCallsFormOneUndoUnit },
+    { name: "automatic retry stays in one undo unit", run: testAutomaticRetryStaysInOneUndoUnit },
+    { name: "automatic compaction continuation stays in one undo unit", run: testAutomaticCompactionContinuationStaysInOneUndoUnit },
+    { name: "queued inputs preserve operation and intermediate anchors", run: testQueuedInputsPreserveOperationAndIntermediateAnchors },
+    { name: "metadata tree nodes inherit semantic workspace anchor", run: testMetadataTreeNodesInheritSemanticWorkspaceAnchor },
     { name: "undo preserves manual changes before next turn", run: testManualChangesProtectedAcrossUndo },
     { name: "repeated undo walks back turn by turn", run: testRepeatedUndo },
+    { name: "repeated undo redo survives reload and failures", run: testRepeatedUndoRedoSurvivesReloadAndFailures },
     { name: "repeated undo crosses manual inter-turn changes", run: testRepeatedUndoAcrossManualInterTurnChanges },
     { name: "checkpoint and dirty tree guard", run: testCheckpointAndTreeGuard },
     { name: "tree switching restores branch-specific workspace", run: testTreeBranchSwitching },

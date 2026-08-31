@@ -82,6 +82,13 @@ interface TurnSnapshotRecord {
   beforeCommit: string;
   afterCommit: string;
   createdAt: string;
+  navigationSnapshots?: NodeSnapshotAnchor[];
+}
+
+interface NodeSnapshotAnchor {
+  entryId: string;
+  commit: string;
+  position: "before" | "after";
 }
 
 interface TurnSnapshotState {
@@ -118,6 +125,12 @@ interface RuntimeState {
   pendingTurnId?: string;
   pendingBeforeCommit?: string;
   pendingPromptText?: string;
+  pendingOriginalUserEntryId?: string;
+  pendingOperationStartLeafId?: string | null;
+  pendingNavigationSnapshots?: NodeSnapshotAnchor[];
+  pendingAnchoredEntryIds?: Set<string>;
+  pendingLastTurnCommit?: string;
+  pendingLastAssistantEntryId?: string;
   internalNavigation?: "undo" | "redo";
   internalNavigationFailureReported?: boolean;
   navigationMode?: NavigationMode;
@@ -1823,6 +1836,9 @@ function getReferencedSnapshotCommits(ctx: ExtensionContext, state?: RuntimeStat
   for (const turn of getTurnSnapshots(state)) {
     commits.add(turn.beforeCommit);
     commits.add(turn.afterCommit);
+    for (const anchor of turn.navigationSnapshots ?? []) {
+      commits.add(anchor.commit);
+    }
   }
   for (const entry of getSnapshotEntries(ctx)) {
     if (hasSnapshotData(entry)) {
@@ -2030,6 +2046,35 @@ function isMessageEntry(entry: SessionEntry | undefined): entry is SessionMessag
   return entry?.type === "message";
 }
 
+function findNavigationSnapshotForEntry(entryId: string, state?: RuntimeState): WorkspaceSnapshot | undefined {
+  const turns = getTurnSnapshots(state);
+  for (let turnIndex = turns.length - 1; turnIndex >= 0; turnIndex -= 1) {
+    const turn = turns[turnIndex] as TurnSnapshotRecord;
+    const anchors = turn.navigationSnapshots ?? [];
+    let anchor: NodeSnapshotAnchor | undefined;
+    for (let anchorIndex = anchors.length - 1; anchorIndex >= 0; anchorIndex -= 1) {
+      if (anchors[anchorIndex]?.entryId === entryId) {
+        anchor = anchors[anchorIndex];
+        break;
+      }
+    }
+    if (!anchor) {
+      continue;
+    }
+    return {
+      v: 1,
+      kind: anchor.position,
+      commit: anchor.commit,
+      turnId: turn.turnId,
+      promptText: turn.promptText,
+      userEntryId: turn.userEntryId,
+      assistantEntryId: turn.assistantEntryId,
+      createdAt: turn.createdAt,
+    };
+  }
+  return undefined;
+}
+
 function findAfterSnapshotForMessageAnchor(
   ctx: ExtensionContext,
   entry: SessionEntry | undefined,
@@ -2037,6 +2082,11 @@ function findAfterSnapshotForMessageAnchor(
 ): WorkspaceSnapshot | undefined {
   if (!entry || entry.type !== "message") {
     return undefined;
+  }
+
+  const anchoredSnapshot = findNavigationSnapshotForEntry(entry.id, state);
+  if (anchoredSnapshot) {
+    return anchoredSnapshot;
   }
 
   const messageEntry = entry as SessionMessageEntry & { id: string; message: { role: string } };
@@ -2073,6 +2123,10 @@ function findAfterSnapshotForMessageAnchor(
 }
 
 function findBeforeSnapshotForUserEntry(userEntryId: string, state?: RuntimeState): WorkspaceSnapshot | undefined {
+  const anchoredSnapshot = findNavigationSnapshotForEntry(userEntryId, state);
+  if (anchoredSnapshot) {
+    return anchoredSnapshot;
+  }
   const turn = findTurnSnapshotByUserEntryId(userEntryId, state);
   return turn ? {
     v: 1,
@@ -2086,7 +2140,11 @@ function findBeforeSnapshotForUserEntry(userEntryId: string, state?: RuntimeStat
   } : undefined;
 }
 
-function findNearestSnapshotOnChain(ctx: ExtensionContext, startId: string | null | undefined): CustomEntry<WorkspaceSnapshot> | undefined {
+function findNearestSnapshotOnChain(
+  ctx: ExtensionContext,
+  startId: string | null | undefined,
+  state?: RuntimeState,
+): WorkspaceSnapshot | CustomEntry<WorkspaceSnapshot> | undefined {
   let currentId = startId ?? null;
   while (currentId) {
     const entry: SessionEntry | undefined = ctx.sessionManager.getEntry(currentId);
@@ -2095,6 +2153,10 @@ function findNearestSnapshotOnChain(ctx: ExtensionContext, startId: string | nul
     }
     if (isSnapshotEntry(entry)) {
       return entry;
+    }
+    const anchoredSnapshot = findNavigationSnapshotForEntry(entry.id, state);
+    if (anchoredSnapshot) {
+      return anchoredSnapshot;
     }
     currentId = entry.parentId;
   }
@@ -2115,11 +2177,20 @@ function resolveSnapshotForTreeTarget(
     return target;
   }
 
-  if (isUserMessageEntry(target)) {
-    return findBeforeSnapshotForUserEntry(target.id, state) ?? findNearestSnapshotOnChain(ctx, target.parentId);
+  const anchoredSnapshot = findNavigationSnapshotForEntry(target.id, state);
+  if (anchoredSnapshot) {
+    return anchoredSnapshot;
   }
 
-  return findAfterSnapshotForMessageAnchor(ctx, target, state) ?? findNearestSnapshotOnChain(ctx, targetId);
+  if (isUserMessageEntry(target)) {
+    return findBeforeSnapshotForUserEntry(target.id, state) ?? findNearestSnapshotOnChain(ctx, target.parentId, state);
+  }
+
+  if (target.type === "custom_message") {
+    return findNearestSnapshotOnChain(ctx, target.parentId, state);
+  }
+
+  return findAfterSnapshotForMessageAnchor(ctx, target, state) ?? findNearestSnapshotOnChain(ctx, targetId, state);
 }
 
 async function ensureBaselineSnapshot(
@@ -2510,6 +2581,12 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
 
       state.pendingTurnId = turnId;
       state.pendingBeforeCommit = commit;
+      state.pendingOperationStartLeafId = ctx.sessionManager.getLeafId();
+      state.pendingOriginalUserEntryId = undefined;
+      state.pendingNavigationSnapshots = [];
+      state.pendingAnchoredEntryIds = new Set<string>();
+      state.pendingLastTurnCommit = undefined;
+      state.pendingLastAssistantEntryId = undefined;
 
       await logLine(
         ctx,
@@ -2531,6 +2608,112 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     }
   }
 
+  function clearPendingAgentOperation(state: RuntimeState): void {
+    state.pendingTurnId = undefined;
+    state.pendingBeforeCommit = undefined;
+    state.pendingPromptText = undefined;
+    state.pendingOriginalUserEntryId = undefined;
+    state.pendingOperationStartLeafId = undefined;
+    state.pendingNavigationSnapshots = undefined;
+    state.pendingAnchoredEntryIds = undefined;
+    state.pendingLastTurnCommit = undefined;
+    state.pendingLastAssistantEntryId = undefined;
+  }
+
+  function getPendingOperationBranchEntries(ctx: ExtensionContext, state: RuntimeState): SessionEntry[] {
+    const branch = ctx.sessionManager.getBranch();
+    const startId = state.pendingOperationStartLeafId;
+    if (!startId) {
+      return branch;
+    }
+    const startIndex = branch.findIndex((entry) => entry.id === startId);
+    return startIndex >= 0 ? branch.slice(startIndex + 1) : branch;
+  }
+
+  async function capturePendingAgentOperation(
+    ctx: ExtensionContext,
+    state: RuntimeState,
+    source: "turn_end" | "agent_settled",
+  ): Promise<void> {
+    if (!state.pendingTurnId || !state.pendingBeforeCommit) {
+      return;
+    }
+
+    const operationEntries = getPendingOperationBranchEntries(ctx, state);
+    const originalUserEntry = state.pendingOriginalUserEntryId
+      ? ctx.sessionManager.getEntry(state.pendingOriginalUserEntryId)
+      : operationEntries.find(isUserMessageEntry);
+    if (!isUserMessageEntry(originalUserEntry)) {
+      await logLine(ctx, `skip operation snapshot: no original user entry turn=${state.pendingTurnId} source=${source}`, state);
+      return;
+    }
+    state.pendingOriginalUserEntryId = originalUserEntry.id;
+
+    const assistantEntries = operationEntries.filter(isAssistantMessageEntry);
+    const latestAssistant = assistantEntries[assistantEntries.length - 1];
+    if (!latestAssistant && !state.pendingLastAssistantEntryId) {
+      await logLine(ctx, `skip operation snapshot: no assistant entry turn=${state.pendingTurnId} source=${source}`, state);
+      return;
+    }
+    if (latestAssistant) {
+      state.pendingLastAssistantEntryId = latestAssistant.id;
+    }
+
+    const previousCommit = state.pendingLastTurnCommit ?? state.pendingBeforeCommit;
+    let commit = previousCommit;
+    const comparison = await isWorkspaceDirtyAgainstCommit(pi, ctx, previousCommit, state);
+    if (comparison !== "clean") {
+      if (comparison === "missing") {
+        await warnMissingSnapshotCommit(ctx, previousCommit, source, state);
+      }
+      commit = await createSnapshotCommit(pi, ctx, `after ${state.pendingTurnId}`, state, true);
+    }
+
+    const anchors = state.pendingNavigationSnapshots ?? [];
+    const anchoredEntryIds = state.pendingAnchoredEntryIds ?? new Set(anchors.map((anchor) => anchor.entryId));
+    for (const entry of operationEntries) {
+      if (anchoredEntryIds.has(entry.id)) {
+        continue;
+      }
+      const isOriginalUser = entry.id === originalUserEntry.id;
+      const isQueuedUser = isUserMessageEntry(entry) && !isOriginalUser;
+      anchors.push({
+        entryId: entry.id,
+        commit: isOriginalUser ? state.pendingBeforeCommit : isQueuedUser ? previousCommit : commit,
+        position: isOriginalUser || isQueuedUser ? "before" : "after",
+      });
+      anchoredEntryIds.add(entry.id);
+    }
+    state.pendingNavigationSnapshots = anchors;
+    state.pendingAnchoredEntryIds = anchoredEntryIds;
+    state.pendingLastTurnCommit = commit;
+
+    const snapshots = await readTurnSnapshotState(ctx, state);
+    const existingIndex = snapshots.turns.findIndex((entry) => entry.turnId === state.pendingTurnId);
+    const existing = existingIndex >= 0 ? snapshots.turns[existingIndex] : undefined;
+    const record: TurnSnapshotRecord = {
+      turnId: state.pendingTurnId,
+      promptText: state.pendingPromptText,
+      userEntryId: originalUserEntry.id,
+      assistantEntryId: state.pendingLastAssistantEntryId as string,
+      beforeCommit: state.pendingBeforeCommit,
+      afterCommit: commit,
+      createdAt: existing?.createdAt ?? new Date().toISOString(),
+      navigationSnapshots: [...anchors],
+    };
+    if (existingIndex >= 0) {
+      snapshots.turns[existingIndex] = record;
+    } else {
+      snapshots.turns.push(record);
+    }
+    await writeTurnSnapshotState(ctx, snapshots, state);
+    await logLine(
+      ctx,
+      `capture operation snapshot source=${source} turn=${record.turnId} userEntry=${record.userEntryId} assistantEntry=${record.assistantEntryId} beforeCommit=${record.beforeCommit} afterCommit=${record.afterCommit} anchors=${anchors.length}`,
+      state,
+    );
+  }
+
   pi.on("session_start", async (_event, ctx) => {
     const startedAt = Date.now();
     const state = getState(ctx);
@@ -2538,6 +2721,12 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     state.pendingTurnId = undefined;
     state.pendingBeforeCommit = undefined;
     state.pendingPromptText = undefined;
+    state.pendingOriginalUserEntryId = undefined;
+    state.pendingOperationStartLeafId = undefined;
+    state.pendingNavigationSnapshots = undefined;
+    state.pendingAnchoredEntryIds = undefined;
+    state.pendingLastTurnCommit = undefined;
+    state.pendingLastAssistantEntryId = undefined;
     state.pendingBeforeSnapshotPrompt = undefined;
     state.internalNavigation = undefined;
     state.internalNavigationFailureReported = undefined;
@@ -2593,6 +2782,10 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     if (!await ensureWorkspaceHistoryAvailable(ctx, state, "input")) {
       return { action: "continue" };
     }
+    if (event.streamingBehavior) {
+      await logLine(ctx, `queued input kept in current operation behavior=${event.streamingBehavior}`, state);
+      return { action: "continue" };
+    }
     state.pendingPromptText = event.text;
     void ensureBeforeSnapshotForTurn(ctx, state, event.text).catch((error) => {
       void logLine(ctx, `input before snapshot failed error=${String(error)}`, state);
@@ -2608,7 +2801,9 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     if (!await ensureWorkspaceHistoryAvailable(ctx, state, "before_agent_start")) {
       return;
     }
-    state.pendingPromptText = event.prompt;
+    if (!state.pendingTurnId && !state.pendingBeforeCommit) {
+      state.pendingPromptText = event.prompt;
+    }
     await ensureBeforeSnapshotForTurn(ctx, state, event.prompt);
     await logLine(ctx, `before_agent_start done ${elapsedMs(startedAt)}ms`, state);
   });
@@ -2631,9 +2826,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     const state = getState(ctx);
     try {
       if (!await ensureWorkspaceHistoryAvailable(ctx, state, "turn_end")) {
-        state.pendingTurnId = undefined;
-        state.pendingBeforeCommit = undefined;
-        state.pendingPromptText = undefined;
+        clearPendingAgentOperation(state);
         return;
       }
       if (!state.pendingTurnId || !state.pendingBeforeCommit) {
@@ -2644,57 +2837,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
         await logLine(ctx, `skip after snapshot: turn_end message role=${String((event.message as { role?: unknown })?.role ?? "unknown")}`, state);
         return;
       }
-
-      const assistantEntry = ctx.sessionManager.getLeafId()
-        ? ctx.sessionManager.getEntry(ctx.sessionManager.getLeafId() as string)
-        : undefined;
-      if (!isAssistantMessageEntry(assistantEntry)) {
-        await logLine(ctx, `skip after snapshot: leaf is not assistant message turn=${state.pendingTurnId}`, state);
-        return;
-      }
-
-      const userEntry = findLatestUserMessageOnBranch(ctx);
-      if (!userEntry) {
-        await logLine(ctx, `skip after snapshot: no user entry found turn=${state.pendingTurnId}`, state);
-        return;
-      }
-
-      let commit = state.pendingBeforeCommit;
-      const comparison = commit
-        ? await isWorkspaceDirtyAgainstCommit(pi, ctx, commit, state)
-        : "missing";
-      if (comparison !== "clean") {
-        if (commit && comparison === "missing") {
-          await warnMissingSnapshotCommit(ctx, commit, "after-turn", state);
-        }
-        commit = await createSnapshotCommit(pi, ctx, `after ${state.pendingTurnId}`, state, true);
-      } else {
-        await logLine(ctx, `reuse before commit for after snapshot turn=${state.pendingTurnId} commit=${commit}`, state);
-      }
-
-      const snapshots = await readTurnSnapshotState(ctx, state);
-      const createdAt = new Date().toISOString();
-      snapshots.turns = snapshots.turns.filter((entry) => entry.turnId !== state.pendingTurnId);
-      snapshots.turns.push({
-        turnId: state.pendingTurnId,
-        promptText: state.pendingPromptText,
-        userEntryId: userEntry.id,
-        assistantEntryId: assistantEntry.id,
-        beforeCommit: state.pendingBeforeCommit,
-        afterCommit: commit,
-        createdAt,
-      });
-      await writeTurnSnapshotState(ctx, snapshots, state);
-
-      await logLine(
-        ctx,
-        `create after snapshot turn=${state.pendingTurnId} userEntry=${userEntry.id} assistantEntry=${assistantEntry.id} beforeCommit=${state.pendingBeforeCommit} afterCommit=${commit}`,
-        state,
-      );
-
-      state.pendingTurnId = undefined;
-      state.pendingBeforeCommit = undefined;
-      state.pendingPromptText = undefined;
+      await capturePendingAgentOperation(ctx, state, "turn_end");
     } catch (error) {
       await logLine(ctx, `after snapshot failed error=${String(error)}`, state);
       throw error;
@@ -2703,18 +2846,24 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
 
   pi.on("agent_end", async (_event, ctx) => {
     const state = getState(ctx);
-    if (!state.pendingTurnId && !state.pendingBeforeCommit && !state.pendingPromptText) {
-      return;
+    if (state.pendingTurnId || state.pendingBeforeCommit) {
+      await logLine(
+        ctx,
+        `agent_end kept pending operation turn=${state.pendingTurnId} beforeCommit=${state.pendingBeforeCommit}`,
+        state,
+      );
     }
+  });
 
-    await logLine(
-      ctx,
-      `clear pending turn without after snapshot turn=${state.pendingTurnId} beforeCommit=${state.pendingBeforeCommit}`,
-      state,
-    );
-    state.pendingTurnId = undefined;
-    state.pendingBeforeCommit = undefined;
-    state.pendingPromptText = undefined;
+  pi.on("agent_settled", async (_event, ctx) => {
+    const state = getState(ctx);
+    try {
+      if (await ensureWorkspaceHistoryAvailable(ctx, state, "agent_settled")) {
+        await capturePendingAgentOperation(ctx, state, "agent_settled");
+      }
+    } finally {
+      clearPendingAgentOperation(state);
+    }
   });
 
   pi.on("session_before_tree", async (event, ctx) => {
