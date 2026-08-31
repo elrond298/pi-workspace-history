@@ -13,6 +13,7 @@ import {
   fauxProvider,
   fauxAssistantMessage,
   fauxToolCall,
+  InMemoryCredentialStore,
 } from "@earendil-works/pi-ai";
 
 async function createWorkspace(rootDir: string, fileCount: number, fileSize: number): Promise<string> {
@@ -61,6 +62,7 @@ async function main(): Promise<void> {
     const cwd = await createWorkspace(rootDir, fileCount, fileSize);
 
     const modelRuntime = await ModelRuntime.create({
+      credentials: new InMemoryCredentialStore(),
       modelsPath: null,
       refreshOnCreate: false,
     });

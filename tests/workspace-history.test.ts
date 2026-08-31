@@ -22,6 +22,7 @@ import {
   fauxProvider,
   fauxAssistantMessage,
   fauxToolCall,
+  InMemoryCredentialStore,
 } from "@earendil-works/pi-ai";
 
 type TestContext = {
@@ -74,6 +75,7 @@ async function createContextForWorkspace(rootDir: string, cwd: string, withProje
   );
 
   const modelRuntime = await ModelRuntime.create({
+    credentials: new InMemoryCredentialStore(),
     modelsPath: null,
     refreshOnCreate: false,
   });
@@ -123,6 +125,17 @@ async function createNonProjectContext(): Promise<TestContext> {
   const cwd = path.join(rootDir, "workspace");
   await mkdir(cwd, { recursive: true });
   return createContextForWorkspace(rootDir, cwd, false);
+}
+
+async function writeWorkspaceHistorySettings(
+  ctx: TestContext,
+  workspaceHistory: Record<string, unknown>,
+): Promise<void> {
+  await writeFile(
+    path.join(ctx.cwd, ".pi", "settings.json"),
+    `${JSON.stringify({ workspaceHistory }, null, 2)}\n`,
+    "utf8",
+  );
 }
 
 async function disposeContext(ctx: TestContext): Promise<void> {
@@ -1529,6 +1542,87 @@ async function testNewSessionReusesWorkspaceShadowRepo(): Promise<void> {
   }
 }
 
+async function testInternalStorageDirDisablesExtension(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    const internalStorageDir = path.join(ctx.cwd, ".pi", "workspace-history");
+    await writeWorkspaceHistorySettings(ctx, {
+      enabled: true,
+      storageDir: internalStorageDir,
+    });
+    const session = await createSession(ctx);
+
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "agent-output.txt", content: "created\n" })]),
+      fauxAssistantMessage("created output"),
+    ]);
+    await session.prompt("create agent-output.txt");
+
+    assert.equal(await pathExists(internalStorageDir), false, "an internal storageDir must not be created");
+    assert.equal(await countSnapshots(session, ctx.cwd), 0, "an internal storageDir must disable all snapshots");
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
+async function testProjectMarkerRequirementCanBeDisabled(): Promise<void> {
+  const ctx = await createNonProjectContext();
+  try {
+    await writeWorkspaceHistorySettings(ctx, {
+      storageDir: getWorkspaceHistoryStateDir(ctx.rootDir),
+      requireProjectMarker: false,
+    });
+    const session = await createSession(ctx);
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "markerless.txt", content: "enabled\n" })]),
+      fauxAssistantMessage("enabled markerless history"),
+    ]);
+
+    await session.prompt("create markerless.txt");
+    await waitFor(
+      async () => await countSnapshots(session, ctx.cwd, "after") >= 1,
+      "requireProjectMarker=false should enable a safe markerless directory",
+    );
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
+async function testAncestorProjectMarkersEnableSubdirectories(): Promise<void> {
+  const markers = [".git", "Cargo.toml", "go.mod", "pyproject.toml"];
+  for (const marker of markers) {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "pi-timemachine-marker-test-"));
+    const projectDir = path.join(rootDir, "project");
+    const cwd = path.join(projectDir, "nested", "workspace");
+    await mkdir(cwd, { recursive: true });
+    const markerPath = path.join(projectDir, marker);
+    if (marker === ".git") {
+      await execFileAsync("git", ["init", projectDir], { cwd: rootDir });
+    } else {
+      await writeFile(markerPath, "# project marker\n", "utf8");
+    }
+    const ctx = await createContextForWorkspace(rootDir, cwd, false);
+    try {
+      const session = await createSession(ctx);
+      const notifications = captureNotifications(session);
+      ctx.provider.setResponses([
+        fauxAssistantMessage([fauxToolCall("write", { path: "recognized.txt", content: `${marker}\n` })]),
+        fauxAssistantMessage("recognized project"),
+      ]);
+      await session.prompt(`recognize ${marker}`);
+      await waitFor(
+        async () => await countSnapshots(session, cwd) >= 1,
+        `${marker} in an ancestor should enable workspace history: ${notifications.join(" | ")}`,
+      );
+      session.dispose();
+    } finally {
+      await disposeContext(ctx);
+    }
+  }
+}
+
 async function testInvalidCurrentShadowRepoIsQuarantinedAndRebuilt(): Promise<void> {
   const ctx = await createContext();
   try {
@@ -1965,6 +2059,110 @@ async function testRestoreFailureDoesNotDeleteCurrentWorkspace(): Promise<void> 
   }
 }
 
+async function testHardExcludesCannotBeNegated(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    await mkdir(path.join(ctx.cwd, "node_modules"), { recursive: true });
+    await writeFile(
+      path.join(ctx.cwd, ".gitignore"),
+      ["!.env.local", "!node_modules/", "!node_modules/keep.txt", ""].join("\n"),
+      "utf8",
+    );
+    const envPath = path.join(ctx.cwd, ".env.local");
+    const dependencyPath = path.join(ctx.cwd, "node_modules", "keep.txt");
+    await writeFile(envPath, "initial secret\n", "utf8");
+    await writeFile(dependencyPath, "initial dependency\n", "utf8");
+
+    const session = await createSession(ctx);
+    const notifications = captureNotifications(session);
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "managed.txt", content: "managed\n" })]),
+      fauxAssistantMessage("created managed file"),
+    ]);
+    await session.prompt("create managed.txt");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "hard exclude snapshot was not created");
+
+    const { stdout: trackedPaths } = await execFileAsync(
+      "git",
+      shadowGitArgs(session, ctx.cwd, "ls-files"),
+      { cwd: ctx.cwd },
+    );
+    assert.doesNotMatch(trackedPaths, /\.env\.local/, "a negated .env rule must not enter snapshot history");
+    assert.doesNotMatch(trackedPaths, /node_modules/, "a negated node_modules rule must not enter snapshot history");
+
+    await writeFile(envPath, "current secret\n", "utf8");
+    await writeFile(dependencyPath, "current dependency\n", "utf8");
+    await session.prompt("/undo");
+
+    await waitForExists(
+      path.join(ctx.cwd, "managed.txt"),
+      false,
+      `hard-excluded edits must not block undo: ${notifications.join(" | ")}`,
+    );
+    assert.equal(normalizeEol(await readText(envPath)), "current secret\n");
+    assert.equal(normalizeEol(await readText(dependencyPath)), "current dependency\n");
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
+async function testLegacyTrackedHardExcludeIsPrunedAndPreservedOnRestore(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    const envPath = path.join(ctx.cwd, ".env.local");
+    await writeFile(envPath, "legacy secret\n", "utf8");
+    const session = await createSession(ctx);
+    captureNotifications(session);
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "first.txt", content: "first\n" })]),
+      fauxAssistantMessage("created first file"),
+      fauxAssistantMessage([fauxToolCall("write", { path: "second.txt", content: "second\n" })]),
+      fauxAssistantMessage("created second file"),
+    ]);
+    await session.prompt("create first.txt");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "legacy fixture snapshot was not created");
+
+    await execFileAsync("git", shadowGitArgs(session, ctx.cwd, "add", "-f", "--", ".env.local"), { cwd: ctx.cwd });
+    await execFileAsync("git", [
+      "-c", "user.name=workspace-history-test",
+      "-c", "user.email=workspace-history-test@local",
+      ...shadowGitArgs(session, ctx.cwd, "commit", "-m", "legacy tracked secret"),
+    ], { cwd: ctx.cwd });
+    const { stdout: oldCommitOutput } = await execFileAsync(
+      "git",
+      shadowGitArgs(session, ctx.cwd, "rev-parse", "HEAD"),
+      { cwd: ctx.cwd },
+    );
+    const oldCommit = oldCommitOutput.trim();
+    const oldSnapshotId = session.sessionManager.appendCustomEntry("workspace-history.snapshot", {
+      v: 1,
+      kind: "manual",
+      commit: oldCommit,
+      label: "legacy tracked secret",
+      createdAt: new Date().toISOString(),
+    });
+
+    await session.prompt("create second.txt");
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 2, "post-upgrade snapshot was not created");
+    const { stdout: trackedAfterUpgrade } = await execFileAsync(
+      "git",
+      shadowGitArgs(session, ctx.cwd, "ls-files"),
+      { cwd: ctx.cwd },
+    );
+    assert.doesNotMatch(trackedAfterUpgrade, /\.env\.local/, "new snapshots must prune hard excludes tracked by older versions");
+
+    await writeFile(envPath, "current secret\n", "utf8");
+    const navigation = await session.navigateTree(oldSnapshotId, { summarize: false });
+    assert.equal(navigation.cancelled, false, "restoring an old snapshot should ignore its hard-excluded files");
+    assert.equal(normalizeEol(await readText(envPath)), "current secret\n", "old snapshots must not overwrite hard-excluded files");
+    await waitForExists(path.join(ctx.cwd, "second.txt"), false, "managed files should still restore to the old snapshot");
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
 async function testTreeRestoreWaitsForTransientWindowsFileLock(): Promise<void> {
   if (process.platform !== "win32") {
     return;
@@ -2360,6 +2558,9 @@ async function main(): Promise<void> {
     { name: "session start does not create baseline eagerly", run: testSessionStartDoesNotCreateBaselineEagerly },
     { name: "idle warmup is reused by first turn", run: testIdleWarmupIsReusedByFirstTurn },
     { name: "non-project workspace disables extension", run: testNonProjectWorkspaceDisablesExtension },
+    { name: "internal storageDir disables extension", run: testInternalStorageDirDisablesExtension },
+    { name: "project marker requirement can be disabled", run: testProjectMarkerRequirementCanBeDisabled },
+    { name: "ancestor project markers enable subdirectories", run: testAncestorProjectMarkersEnableSubdirectories },
     { name: "conversation-only undo keeps workspace", run: testUndoConversationOnlyKeepsWorkspace },
     { name: "redo reuses conversation-only undo mode", run: testRedoReusesConversationOnlyMode },
     { name: "cancelling navigation choice keeps conversation and workspace", run: testNavigationChoiceCancellationKeepsConversationAndWorkspace },
@@ -2390,6 +2591,8 @@ async function main(): Promise<void> {
     { name: "unicode paths survive undo and redo", run: testUnicodePathsSurviveUndoRedo },
     { name: "undo and redo block on unsnapshotted manual changes", run: testUndoAndRedoBlockOnUnsnapshottedManualChanges },
     { name: ".gitignore stops managing ignored paths", run: testGitignoreStopsManagingIgnoredPaths },
+    { name: "hard excludes cannot be negated", run: testHardExcludesCannotBeNegated },
+    { name: "legacy tracked hard exclude is pruned and preserved on restore", run: testLegacyTrackedHardExcludeIsPrunedAndPreservedOnRestore },
     { name: "restore failure does not delete current workspace", run: testRestoreFailureDoesNotDeleteCurrentWorkspace },
     { name: "tree restore waits for a transient Windows file lock", run: testTreeRestoreWaitsForTransientWindowsFileLock },
     { name: "tree restore retries locked Windows file replacement", run: testTreeRestoreRetriesLockedWindowsFileReplacement },

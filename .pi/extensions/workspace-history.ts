@@ -16,10 +16,8 @@ import {
   stat,
   unlink,
   writeFile,
-  mkdir as fsMkdir,
   rm as fsRm,
   readdir,
-  cp,
 } from "node:fs/promises";
 import { createHash, randomUUID } from "node:crypto";
 import ignore, { type Ignore } from "ignore";
@@ -141,6 +139,7 @@ interface RuntimeState {
   baselineWarmupInProgress?: boolean;
   cachedGitignoreSource?: string;
   cachedSnapshotIgnoreMatcher?: Ignore;
+  cachedHardExcludeMatcher?: Ignore;
   cachedExcludeSource?: string;
   snapshotWritePromise?: Promise<unknown>;
   beforeSnapshotPromise?: Promise<void>;
@@ -177,6 +176,7 @@ interface WorkspaceHistorySettings {
 interface WorkspaceHistoryAvailability {
   enabled: boolean;
   reason?: string;
+  unsafeStorageDir?: boolean;
 }
 
 interface WorkspaceStoragePaths {
@@ -378,6 +378,42 @@ async function hasProjectMarker(cwd: string): Promise<boolean> {
   }
 }
 
+function normalizePathForComparison(filePath: string): string {
+  const normalized = path.normalize(filePath);
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+function isSameOrDescendantPath(parentPath: string, candidatePath: string): boolean {
+  const relativePath = path.relative(
+    normalizePathForComparison(parentPath),
+    normalizePathForComparison(candidatePath),
+  );
+  return relativePath === "" || (!relativePath.startsWith("..") && !path.isAbsolute(relativePath));
+}
+
+async function resolvePotentialRealpath(filePath: string): Promise<string> {
+  const suffix: string[] = [];
+  let current = path.resolve(filePath);
+  for (;;) {
+    const resolved = await realpath(current).catch(() => undefined);
+    if (resolved) {
+      return path.join(resolved, ...suffix.reverse());
+    }
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return path.resolve(filePath);
+    }
+    suffix.push(path.basename(current));
+    current = parent;
+  }
+}
+
+async function isStorageDirInsideWorkspace(ctx: ExtensionContext, storageDir: string): Promise<boolean> {
+  const workspaceRealpath = await resolvePotentialRealpath(ctx.cwd);
+  const storageRealpath = await resolvePotentialRealpath(storageDir);
+  return isSameOrDescendantPath(workspaceRealpath, storageRealpath);
+}
+
 async function readSettingsFile(settingsPath: string): Promise<Record<string, unknown>> {
   try {
     return parseJsonObject(await readFile(settingsPath, "utf8"));
@@ -417,7 +453,13 @@ async function evaluateWorkspaceHistoryAvailability(ctx: ExtensionContext, state
   const settings = await getWorkspaceHistorySettings(ctx, state);
   let availability: WorkspaceHistoryAvailability;
 
-  if (settings.enabled === false) {
+  if (await isStorageDirInsideWorkspace(ctx, settings.storageDir)) {
+    availability = {
+      enabled: false,
+      reason: `workspaceHistory.storageDir must be outside the workspace (${settings.storageDir})`,
+      unsafeStorageDir: true,
+    };
+  } else if (settings.enabled === false) {
     availability = { enabled: false, reason: "disabled by configuration" };
   } else if (settings.enabled === true) {
     availability = { enabled: true };
@@ -432,8 +474,6 @@ async function evaluateWorkspaceHistoryAvailability(ctx: ExtensionContext, state
     } else if (normalizedCwd === root) {
       availability = { enabled: false, reason: "current directory is a filesystem root" };
     } else if (settings.requireProjectMarker && !(await hasProjectMarker(resolvedCwd))) {
-      availability = { enabled: false, reason: "no project marker found" };
-    } else if (!(await pathExists(path.join(resolvedCwd, "package.json"))) && !(await pathExists(path.join(resolvedCwd, ".git")))) {
       availability = { enabled: false, reason: "no project marker found" };
     } else {
       availability = { enabled: true };
@@ -493,6 +533,9 @@ async function getWorkspaceStoragePaths(ctx: ExtensionContext, state?: RuntimeSt
 
 async function ensureStorageDirs(ctx: ExtensionContext, state?: RuntimeState): Promise<WorkspaceStoragePaths> {
   const paths = await getWorkspaceStoragePaths(ctx, state);
+  if (await isStorageDirInsideWorkspace(ctx, paths.storageDir)) {
+    throw new Error(`workspaceHistory.storageDir must be outside the workspace (${paths.storageDir})`);
+  }
   await mkdir(path.dirname(paths.logFile), { recursive: true });
   await mkdir(paths.sessionRoot, { recursive: true });
   return paths;
@@ -797,8 +840,6 @@ async function getSnapshotIgnoreMatcher(ctx: ExtensionContext, state?: RuntimeSt
   }
 
   const matcher = ignore();
-  matcher.add(DEFAULT_EXCLUDES);
-  matcher.add(getWindowsReservedIgnorePatterns());
   if (gitignoreSource.trim().length > 0) {
     matcher.add(gitignoreSource);
   }
@@ -811,17 +852,44 @@ async function getSnapshotIgnoreMatcher(ctx: ExtensionContext, state?: RuntimeSt
   return matcher;
 }
 
+function getHardExcludeMatcher(state?: RuntimeState): Ignore {
+  if (state?.cachedHardExcludeMatcher) {
+    return state.cachedHardExcludeMatcher;
+  }
+  const matcher = ignore().add(DEFAULT_EXCLUDES);
+  if (state) {
+    state.cachedHardExcludeMatcher = matcher;
+  }
+  return matcher;
+}
+
+async function isSnapshotPathExcluded(
+  ctx: ExtensionContext,
+  relativePath: string,
+  state?: RuntimeState,
+): Promise<boolean> {
+  const normalizedPath = normalizeSnapshotPath(relativePath);
+  if (isWindowsReservedSnapshotPath(normalizedPath) || getHardExcludeMatcher(state).ignores(normalizedPath)) {
+    return true;
+  }
+  return (await getSnapshotIgnoreMatcher(ctx, state)).ignores(normalizedPath);
+}
+
 async function filterSnapshotPaths(
   ctx: ExtensionContext,
   relativePaths: string[],
   state?: RuntimeState,
 ): Promise<string[]> {
-  const matcher = await getSnapshotIgnoreMatcher(ctx, state);
-  return relativePaths.filter((relativePath) => !matcher.ignores(normalizeSnapshotPath(relativePath)) && !isWindowsReservedSnapshotPath(relativePath));
+  const includedPaths: string[] = [];
+  for (const relativePath of relativePaths) {
+    if (!await isSnapshotPathExcluded(ctx, relativePath, state)) {
+      includedPaths.push(relativePath);
+    }
+  }
+  return includedPaths;
 }
 
 async function listExcludedWorkspacePaths(ctx: ExtensionContext, state?: RuntimeState): Promise<string[]> {
-  const matcher = await getSnapshotIgnoreMatcher(ctx, state);
   const budget = await getScanBudget(ctx, state);
   const startedAt = Date.now();
   let scannedFiles = 0;
@@ -852,7 +920,7 @@ async function listExcludedWorkspacePaths(ctx: ExtensionContext, state?: Runtime
         scannedFiles += 1;
       }
       checkBudget(relativePath);
-      if (matcher.ignores(normalizeSnapshotPath(relativePath)) || isWindowsReservedSnapshotPath(relativePath)) {
+      if (await isSnapshotPathExcluded(ctx, relativePath, state)) {
         excludedPaths.push(relativePath);
         continue;
       }
@@ -875,6 +943,11 @@ function parseNullSeparatedPaths(raw: string): string[] {
 
 async function logLine(ctx: ExtensionContext, line: string, state?: RuntimeState): Promise<void> {
   if (!isWorkspaceHistoryLoggingEnabled()) {
+    return;
+  }
+
+  const settings = await getWorkspaceHistorySettings(ctx, state);
+  if (await isStorageDirInsideWorkspace(ctx, settings.storageDir)) {
     return;
   }
 
@@ -912,9 +985,9 @@ async function syncShadowRepoExclude(ctx: ExtensionContext, state?: RuntimeState
   const gitignoreSource = await readFile(path.join(ctx.cwd, ".gitignore"), "utf8").catch(() => "");
   const excludePath = path.join(paths.shadowGitDir, "info", "exclude");
   const excludeSource = [
+    gitignoreSource.trim().length > 0 ? gitignoreSource.trimEnd() : "",
     ...DEFAULT_EXCLUDES.map(normalizeSnapshotPath),
     ...getWindowsReservedIgnorePatterns(),
-    gitignoreSource.trim().length > 0 ? gitignoreSource.trimEnd() : "",
   ]
     .filter((part) => part.length > 0)
     .join("\n");
@@ -928,6 +1001,24 @@ async function syncShadowRepoExclude(ctx: ExtensionContext, state?: RuntimeState
   if (state) {
     state.cachedExcludeSource = excludeSource;
   }
+}
+
+function parsePorcelainStatusPaths(raw: string): string[] {
+  const records = raw.split("\0").filter((record) => record.length > 0);
+  const paths: string[] = [];
+  for (let index = 0; index < records.length; index += 1) {
+    const record = records[index] as string;
+    const status = record.slice(0, 2);
+    paths.push(record.slice(3));
+    if (status[0] === "R" || status[0] === "C") {
+      const sourcePath = records[index + 1];
+      if (sourcePath) {
+        paths.push(sourcePath);
+        index += 1;
+      }
+    }
+  }
+  return paths;
 }
 
 function getGitRestoreFileOperationFailureDetail(value: unknown): string | undefined {
@@ -1051,23 +1142,14 @@ async function removeExcludedPathsFromShadowIndex(
 async function pruneShadowIndexForIgnoreChanges(pi: ExtensionAPI, ctx: ExtensionContext, state?: RuntimeState): Promise<void> {
   const startedAt = Date.now();
   const gitignoreSource = await readFile(path.join(ctx.cwd, ".gitignore"), "utf8").catch(() => "");
-  if (state?.lastIndexPruneIgnoreSource === gitignoreSource) {
-    await logLine(ctx, `prune ignored paths skipped cached ${elapsedMs(startedAt)}ms`, state);
-    return;
-  }
-
-  if (state && state.lastIndexPruneIgnoreSource === undefined) {
-    state.lastIndexPruneIgnoreSource = gitignoreSource;
-    await logLine(ctx, `prune ignored paths skipped initial ${elapsedMs(startedAt)}ms`, state);
-    return;
-  }
-
-  const excludedPaths = await listExcludedWorkspacePaths(ctx, state);
-  await logLine(ctx, `prune ignored paths scanned ${elapsedMs(startedAt)}ms count=${excludedPaths.length}`, state);
+  const trackedOutput = await execGit(pi, ctx, await gitArgs(ctx, state, "ls-files", "-z"));
+  const trackedPaths = parseNullSeparatedPaths(trackedOutput);
+  const includedPaths = new Set(await filterSnapshotPaths(ctx, trackedPaths, state));
+  const excludedPaths = trackedPaths.filter((relativePath) => !includedPaths.has(relativePath));
+  await logLine(ctx, `prune ignored paths checked ${elapsedMs(startedAt)}ms count=${excludedPaths.length}`, state);
   await removeExcludedPathsFromShadowIndex(pi, ctx, excludedPaths, state);
   if (state) {
     state.lastIndexPruneIgnoreSource = gitignoreSource;
-    state.lastExcludedWorkspacePaths = excludedPaths;
   }
   await logLine(ctx, `prune ignored paths done ${elapsedMs(startedAt)}ms count=${excludedPaths.length}`, state);
 }
@@ -1096,7 +1178,8 @@ async function hasWorkspaceChanges(pi: ExtensionAPI, ctx: ExtensionContext, stat
     throw new Error(statusResult.stderr || statusResult.stdout || "git status failed");
   }
 
-  const changed = statusResult.stdout.length > 0;
+  const changedPaths = parsePorcelainStatusPaths(statusResult.stdout);
+  const changed = (await filterSnapshotPaths(ctx, changedPaths, state)).length > 0;
   await logLine(ctx, `workspace changes check done ${elapsedMs(startedAt)}ms changed=${String(changed)}`, state);
   return changed;
 }
@@ -1271,6 +1354,7 @@ async function createSnapshotCommit(
     await logLine(ctx, `snapshot commit start label=${label} assumeDirty=${String(assumeDirty)}`, state);
     await assertWorkspaceHistoryEnabled(ctx, state, "createSnapshotCommit");
     await ensureShadowRepo(pi, ctx, state);
+    await pruneShadowIndexForIgnoreChanges(pi, ctx, state);
     if (!assumeDirty) {
       const currentHead = state?.lastKnownShadowHead ?? await getHeadCommit(pi, ctx, state);
       if (state && currentHead) {
@@ -1301,43 +1385,45 @@ async function createSnapshotCommit(
   });
 }
 
-async function restoreSnapshotCommit(pi: ExtensionAPI, ctx: ExtensionContext, commit: string, state?: RuntimeState): Promise<void> {
+async function restoreSnapshotCommit(pi: ExtensionAPI, ctx: ExtensionContext, commit: string, state?: RuntimeState): Promise<string> {
   await assertWorkspaceHistoryEnabled(ctx, state, "restoreSnapshotCommit");
   await ensureShadowRepo(pi, ctx, state);
-  const protectedPaths = state?.lastExcludedWorkspacePaths ?? [];
-  const excludedBackupDir = path.join(
-    (await getWorkspaceStoragePaths(ctx, state)).sessionRoot,
-    `excluded-backup-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+  const protectedPaths = await listExcludedWorkspacePaths(ctx, state);
+
+  await execGit(pi, ctx, await gitArgs(ctx, state, "reset", "--mixed", "--no-refresh", commit));
+  await pruneShadowIndexForIgnoreChanges(pi, ctx, state);
+  await execGit(pi, ctx, await gitArgs(ctx, state, "checkout-index", "-a", "-f"));
+  await execGit(
+    pi,
+    ctx,
+    await gitArgs(
+      ctx,
+      state,
+      "clean",
+      "-fd",
+      ...protectedPaths.flatMap((relativePath) => ["-e", normalizeSnapshotPath(relativePath)]),
+      "--",
+      ".",
+    ),
   );
-  try {
-    for (const relativePath of protectedPaths) {
-      const source = path.join(ctx.cwd, relativePath);
-      if (!await exists(source)) {
-        continue;
-      }
-      const target = path.join(excludedBackupDir, relativePath);
-      await fsMkdir(path.dirname(target), { recursive: true });
-      await cp(source, target, { recursive: true, force: true, errorOnExist: false }).catch(() => undefined);
-    }
 
-    await execGit(pi, ctx, await gitArgs(ctx, state, "reset", "--hard", commit));
-    if (state) {
-      state.lastKnownShadowHead = commit;
-    }
-    await execGit(pi, ctx, await gitArgs(ctx, state, "clean", "-fd", ...protectedPaths.flatMap((relativePath) => ["-e", normalizeSnapshotPath(relativePath)]), "--", "."));
-
-    for (const relativePath of protectedPaths) {
-      const source = path.join(excludedBackupDir, relativePath);
-      if (!await exists(source)) {
-        continue;
-      }
-      const target = path.join(ctx.cwd, relativePath);
-      await fsMkdir(path.dirname(target), { recursive: true });
-      await cp(source, target, { recursive: true, force: true, errorOnExist: false });
-    }
-  } finally {
-    await fsRm(excludedBackupDir, { recursive: true, force: true }).catch(() => undefined);
+  const targetTree = await execGit(pi, ctx, await gitArgs(ctx, state, "rev-parse", `${commit}^{tree}`));
+  const filteredTree = await execGit(pi, ctx, await gitArgs(ctx, state, "write-tree"));
+  let restoredCommit = commit;
+  if (filteredTree !== targetTree) {
+    await execGit(
+      pi,
+      ctx,
+      await gitCommitArgs(ctx, state, "commit", "--allow-empty", "-m", `[workspace-history] filtered restore ${commit}`),
+    );
+    restoredCommit = await execGit(pi, ctx, await gitArgs(ctx, state, "rev-parse", "HEAD"));
+    await retainSnapshotCommit(pi, ctx, restoredCommit, state);
   }
+  if (state) {
+    state.lastKnownShadowHead = restoredCommit;
+    state.lastExcludedWorkspacePaths = protectedPaths;
+  }
+  return restoredCommit;
 }
 
 function isTransientWindowsRestoreError(error: unknown): boolean {
@@ -1349,11 +1435,10 @@ async function restoreSnapshotCommitWithRetry(
   ctx: ExtensionContext,
   commit: string,
   state?: RuntimeState,
-): Promise<void> {
+): Promise<string> {
   for (let attempt = 0; ; attempt += 1) {
     try {
-      await restoreSnapshotCommit(pi, ctx, commit, state);
-      return;
+      return await restoreSnapshotCommit(pi, ctx, commit, state);
     } catch (error) {
       const delayMs = RESTORE_FILE_LOCK_RETRY_DELAYS_MS[attempt];
       if (delayMs === undefined || !isTransientWindowsRestoreError(error)) {
@@ -1445,14 +1530,15 @@ async function restoreSnapshotCommitSafely(
   ctx: ExtensionContext,
   targetCommit: string,
   state?: RuntimeState,
-): Promise<void> {
+): Promise<string> {
   await assertWorkspaceHistoryEnabled(ctx, state, "restoreSnapshotCommitSafely");
   const rollbackCommit = await createSnapshotCommit(pi, ctx, `rollback ${randomUUID()}`, state);
 
   try {
-    await restoreSnapshotCommitWithRetry(pi, ctx, targetCommit, state);
+    const restoredCommit = await restoreSnapshotCommitWithRetry(pi, ctx, targetCommit, state);
     await touchWorkspaceAndSessionMeta(ctx, state);
     scheduleCleanup(ctx, state);
+    return restoredCommit;
   } catch (error) {
     try {
       await restoreSnapshotCommitWithRetry(pi, ctx, rollbackCommit, state);
@@ -2151,18 +2237,19 @@ async function restoreResolvedSnapshot(
   targetId: string,
   snapshot: WorkspaceSnapshot | CustomEntry<WorkspaceSnapshot>,
   state?: RuntimeState,
-): Promise<void> {
+): Promise<string> {
   const snapshotData = getResolvedSnapshotData(snapshot);
   if (!snapshotData) {
     throw new Error("snapshot data missing");
   }
 
-  await restoreSnapshotCommitSafely(pi, ctx, snapshotData.commit, state);
+  const restoredCommit = await restoreSnapshotCommitSafely(pi, ctx, snapshotData.commit, state);
   await logLine(
     ctx,
-    `restore source=${source} target=${targetId} kind=${snapshotData.kind} commit=${snapshotData.commit} ok`,
+    `restore source=${source} target=${targetId} kind=${snapshotData.kind} commit=${snapshotData.commit} restoredCommit=${restoredCommit} ok`,
     state,
   );
+  return restoredCommit;
 }
 
 const CLEANUP_INTERVAL_MS = 60_000;
@@ -2246,10 +2333,10 @@ async function ensureWorkspaceHistoryAvailable(
   }
 
   if (state.disabledNoticeReason !== availability.reason) {
-    ctx.ui.notify(
-      `Workspace history is disabled for this directory: ${availability.reason ?? "unknown reason"}. Open pi inside a project directory or set workspaceHistory.enabled to true.`,
-      "warning",
-    );
+    const message = availability.unsafeStorageDir
+      ? `Workspace history is disabled: ${availability.reason}. Move storageDir to a directory outside the workspace, then reload Pi.`
+      : `Workspace history is disabled for this directory: ${availability.reason ?? "unknown reason"}. Open pi inside a project directory or set workspaceHistory.enabled to true.`;
+    ctx.ui.notify(message, "warning");
     state.disabledNoticeReason = availability.reason;
   }
   await logLine(ctx, `${action} blocked: ${availability.reason ?? "disabled"}`, state);
@@ -2757,22 +2844,29 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
         );
         return cancelNavigation("This history node's workspace snapshot is no longer available. Navigation cancelled.");
       }
-      await restoreResolvedSnapshot(pi, ctx, state.internalNavigation ?? "tree", event.preparation.targetId, snapshotData, state);
+      const restoredCommit = await restoreResolvedSnapshot(
+        pi,
+        ctx,
+        state.internalNavigation ?? "tree",
+        event.preparation.targetId,
+        snapshotData,
+        state,
+      );
       const resultLeafId = getTreeNavigationResultLeafId(ctx, event.preparation.targetId);
       const resultSnapshot = resultLeafId
         ? resolveSnapshotForTreeTarget(ctx, resultLeafId, state)
         : undefined;
       const resultSnapshotData = getResolvedSnapshotData(resultSnapshot);
-      if (resultSnapshotData?.commit !== snapshotData.commit) {
+      if (resultSnapshotData?.commit !== restoredCommit) {
         state.pendingWorkspaceAnchor = {
-          commit: snapshotData.commit,
+          commit: restoredCommit,
           label: "restored workspace navigation",
           oldLeafId: event.preparation.oldLeafId,
           targetId: event.preparation.targetId,
         };
         await logLine(
           ctx,
-          `preserve divergent restored workspace target=${event.preparation.targetId} resultLeaf=${String(resultLeafId)} commit=${snapshotData.commit}`,
+          `preserve divergent restored workspace target=${event.preparation.targetId} resultLeaf=${String(resultLeafId)} commit=${restoredCommit}`,
           state,
         );
       }
