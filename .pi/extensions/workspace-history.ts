@@ -26,6 +26,7 @@ import path from "node:path";
 
 const SNAPSHOT_TYPE = "workspace-history.snapshot";
 const SNAPSHOT_RETENTION_REF_PREFIX = "refs/workspace-history/snapshots";
+const ACTIVE_SESSION_LEASE_FILE = "active-session.json";
 
 const DEFAULT_MAX_SESSIONS_PER_WORKSPACE = 3;
 const DEFAULT_MAX_WORKSPACES = 10;
@@ -166,6 +167,7 @@ interface RuntimeState {
   reusableRepoFailureNoticeShown?: boolean;
   validatedShadowGitDir?: string;
   warnedMissingSnapshotCommits?: Set<string>;
+  sessionLeaseOwnerId?: string;
 }
 
 interface NavigationPrecheckResult {
@@ -203,6 +205,7 @@ interface WorkspaceStoragePaths {
   redoFile: string;
   recoveryFile: string;
   turnSnapshotsFile: string;
+  sessionLeaseFile: string;
   workspaceMetaFile: string;
   sessionMetaFile: string;
   logFile: string;
@@ -222,6 +225,14 @@ interface SessionMeta {
   sessionId: string;
   createdAt: string;
   lastUsedAt: string;
+}
+
+interface SessionLease {
+  version: 1;
+  sessionId: string;
+  ownerId: string;
+  processId: number;
+  createdAt: string;
 }
 
 const DEFAULT_EXCLUDES = [
@@ -526,6 +537,7 @@ async function buildWorkspaceStoragePaths(ctx: ExtensionContext, settings: Works
     redoFile: path.join(sessionRoot, "redo.json"),
     recoveryFile: path.join(sessionRoot, "pending-recovery.json"),
     turnSnapshotsFile: path.join(sessionRoot, "turn-snapshots.json"),
+    sessionLeaseFile: path.join(sessionRoot, ACTIVE_SESSION_LEASE_FILE),
     workspaceMetaFile: path.join(workspaceRoot, "meta.json"),
     sessionMetaFile: path.join(sessionRoot, "meta.json"),
     logFile: path.join(settings.storageDir, "logs", "timemachine.log"),
@@ -557,6 +569,17 @@ async function ensureStorageDirs(ctx: ExtensionContext, state?: RuntimeState): P
 async function writeJsonFile(filePath: string, value: unknown): Promise<void> {
   await mkdir(path.dirname(filePath), { recursive: true });
   await writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+async function writeJsonFileAtomically(filePath: string, value: unknown): Promise<void> {
+  await mkdir(path.dirname(filePath), { recursive: true });
+  const temporaryFile = `${filePath}.${process.pid}-${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporaryFile, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    await rename(temporaryFile, filePath);
+  } finally {
+    await unlink(temporaryFile).catch(() => undefined);
+  }
 }
 
 async function readJsonFile<T>(filePath: string): Promise<T | undefined> {
@@ -689,7 +712,7 @@ function notifyInvalidShadowRepoRecovery(ctx: ExtensionContext, state: RuntimeSt
   }
   if (!state?.invalidShadowRepoNoticeShown) {
     ctx.ui.notify(
-      "Workspace history found an invalid snapshot repository and rebuilt it. Older snapshots from this session may be unavailable.",
+      "Workspace history found a missing or invalid snapshot repository and rebuilt it. Older snapshots from this session may be unavailable.",
       "warning",
     );
   }
@@ -713,6 +736,73 @@ function isValidSessionMeta(value: unknown, sessionId: string): value is Session
     && value.sessionId === sessionId
     && isValidMetaTimestamp(value.createdAt)
     && isValidMetaTimestamp(value.lastUsedAt);
+}
+
+function isValidSessionLease(value: unknown, sessionId: string): value is SessionLease {
+  return isJsonRecord(value)
+    && value.version === 1
+    && value.sessionId === sessionId
+    && typeof value.ownerId === "string"
+    && value.ownerId.length > 0
+    && typeof value.processId === "number"
+    && Number.isInteger(value.processId)
+    && value.processId > 0
+    && isValidMetaTimestamp(value.createdAt);
+}
+
+function isProcessRunning(processId: number): boolean {
+  try {
+    process.kill(processId, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function acquireSessionLease(ctx: ExtensionContext, state?: RuntimeState): Promise<void> {
+  const paths = await ensureStorageDirs(ctx, state);
+  const ownerId = randomUUID();
+  await writeJsonFileAtomically(paths.sessionLeaseFile, {
+    version: 1,
+    sessionId: ctx.sessionManager.getSessionId(),
+    ownerId,
+    processId: process.pid,
+    createdAt: new Date().toISOString(),
+  } satisfies SessionLease);
+  if (state) {
+    state.sessionLeaseOwnerId = ownerId;
+  }
+}
+
+async function releaseSessionLease(ctx: ExtensionContext, state?: RuntimeState): Promise<void> {
+  const ownerId = state?.sessionLeaseOwnerId;
+  if (!ownerId) {
+    return;
+  }
+  const paths = await getWorkspaceStoragePaths(ctx, state);
+  const lease = await readJsonFile<unknown>(paths.sessionLeaseFile);
+  if (isValidSessionLease(lease, ctx.sessionManager.getSessionId()) && lease.ownerId === ownerId) {
+    await unlink(paths.sessionLeaseFile).catch((error) => {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw error;
+      }
+    });
+  }
+  state.sessionLeaseOwnerId = undefined;
+}
+
+async function hasActiveSessionLease(sessionRoot: string, sessionId: string): Promise<boolean> {
+  const lease = await readJsonFile<unknown>(path.join(sessionRoot, ACTIVE_SESSION_LEASE_FILE));
+  return isValidSessionLease(lease, sessionId) && isProcessRunning(lease.processId);
+}
+
+async function hasActiveWorkspaceSession(workspaceRoot: string): Promise<boolean> {
+  const sessionsRoot = path.join(workspaceRoot, "sessions");
+  const sessionIds = await listSubdirectories(sessionsRoot);
+  const activeLeases = await Promise.all(sessionIds.map((sessionId) => {
+    return hasActiveSessionLease(path.join(sessionsRoot, sessionId), sessionId);
+  }));
+  return activeLeases.some(Boolean);
 }
 
 function isValidWorkspaceMeta(value: unknown, workspaceHash: string): value is WorkspaceMeta {
@@ -822,16 +912,27 @@ async function cleanupWorkspaceHistory(ctx: ExtensionContext, state?: RuntimeSta
     const sessionRoot = path.join(paths.sessionsRoot, sessionId);
     const meta = await readJsonFile<unknown>(path.join(sessionRoot, "meta.json"));
     return isValidSessionMeta(meta, sessionId)
-      ? { sessionId, sessionRoot, lastUsedAt: meta.lastUsedAt }
+      ? {
+        sessionId,
+        sessionRoot,
+        lastUsedAt: meta.lastUsedAt,
+        active: sessionId === currentSessionId || await hasActiveSessionLease(sessionRoot, sessionId),
+      }
       : undefined;
   }))).filter((record): record is NonNullable<typeof record> => record !== undefined);
 
+  const activeSessionCount = sessionRecords.filter((record) => record.active).length;
   const removableSessions = sessionRecords
-    .filter((record) => record.sessionId !== currentSessionId)
+    .filter((record) => !record.active)
     .sort((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
 
-  for (const record of removableSessions.slice(Math.max(0, settings.maxSessionsPerWorkspace - 1))) {
+  const inactiveSessionCapacity = Math.max(0, settings.maxSessionsPerWorkspace - activeSessionCount);
+  for (const record of removableSessions.slice(inactiveSessionCapacity)) {
     try {
+      if (await hasActiveSessionLease(record.sessionRoot, record.sessionId)) {
+        await logLine(ctx, `cleanup session skipped after lease recheck sessionId=${record.sessionId}`, state);
+        continue;
+      }
       await fsRm(record.sessionRoot, { recursive: true, force: true });
     } catch (error) {
       await logLine(
@@ -849,16 +950,27 @@ async function cleanupWorkspaceHistory(ctx: ExtensionContext, state?: RuntimeSta
     const workspaceRoot = path.join(workspacesRoot, workspaceId);
     const meta = await readJsonFile<unknown>(path.join(workspaceRoot, "meta.json"));
     return isValidWorkspaceMeta(meta, workspaceId)
-      ? { workspaceId, workspaceRoot, lastUsedAt: meta.lastUsedAt }
+      ? {
+        workspaceId,
+        workspaceRoot,
+        lastUsedAt: meta.lastUsedAt,
+        active: workspaceId === paths.workspaceHash || await hasActiveWorkspaceSession(workspaceRoot),
+      }
       : undefined;
   }))).filter((record): record is NonNullable<typeof record> => record !== undefined);
 
+  const activeWorkspaceCount = workspaceRecords.filter((record) => record.active).length;
   const removableWorkspaces = workspaceRecords
-    .filter((record) => record.workspaceId !== paths.workspaceHash)
+    .filter((record) => !record.active)
     .sort((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
 
-  for (const record of removableWorkspaces.slice(Math.max(0, settings.maxWorkspaces - 1))) {
+  const inactiveWorkspaceCapacity = Math.max(0, settings.maxWorkspaces - activeWorkspaceCount);
+  for (const record of removableWorkspaces.slice(inactiveWorkspaceCapacity)) {
     try {
+      if (await hasActiveWorkspaceSession(record.workspaceRoot)) {
+        await logLine(ctx, `cleanup workspace skipped after lease recheck workspaceId=${record.workspaceId}`, state);
+        continue;
+      }
       await fsRm(record.workspaceRoot, { recursive: true, force: true });
     } catch (error) {
       await logLine(
@@ -1303,10 +1415,15 @@ async function ensureShadowRepo(pi: ExtensionAPI, ctx: ExtensionContext, state?:
   await assertWorkspaceHistoryEnabled(ctx, state, "ensureShadowRepo");
   const paths = await ensureStorageDirs(ctx, state);
   if (state?.validatedShadowGitDir === paths.shadowGitDir) {
-    await syncShadowRepoExclude(ctx, state);
-    notifyInvalidShadowRepoRecovery(ctx, state, false);
-    await logLine(ctx, `ensure shadow repo cached done ${elapsedMs(startedAt)}ms`, state);
-    return;
+    if (await exists(path.join(paths.shadowGitDir, "HEAD"))) {
+      await syncShadowRepoExclude(ctx, state);
+      notifyInvalidShadowRepoRecovery(ctx, state, false);
+      await logLine(ctx, `ensure shadow repo cached done ${elapsedMs(startedAt)}ms`, state);
+      return;
+    }
+    clearShadowRepoRuntimeCaches(state);
+    state.invalidShadowRepoRecoveryPending = true;
+    await logLine(ctx, `ensure shadow repo cached path missing gitDir=${paths.shadowGitDir}`, state, true);
   }
 
   let rebuiltInvalidRepo = false;
@@ -2833,6 +2950,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     state.reusableRepoFailureNoticeShown = false;
     state.validatedShadowGitDir = undefined;
     state.warnedMissingSnapshotCommits = undefined;
+    state.sessionLeaseOwnerId = undefined;
 
     if (!await ensureWorkspaceHistoryAvailable(ctx, state, "session_start")) {
       return;
@@ -2840,6 +2958,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
 
     await getWorkspaceHistorySettings(ctx, state);
     await getWorkspaceStoragePaths(ctx, state);
+    await acquireSessionLease(ctx, state);
     state.pendingRecovery = await readPendingRecoveryState(ctx, state);
     if (state.pendingRecovery) {
       await logLine(ctx, `pending workspace recovery loaded commit=${state.pendingRecovery.commit}`, state);
@@ -2855,6 +2974,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
   pi.on("session_shutdown", async (_event, ctx) => {
     const state = getState(ctx);
     await state.reusableRepoUpdatePromise?.catch(() => undefined);
+    await releaseSessionLease(ctx, state);
   });
 
   pi.on("input", async (event, ctx) => {

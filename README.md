@@ -136,7 +136,7 @@ During restore, the plugin restores only the managed file set instead of doing a
 
 On Windows, restore operations retry briefly locked managed files. If a lock persists, navigation is cancelled without skipping the file and the notification identifies the Git file operation that failed. Pending recovery survives a session or extension reload; edits made after the failed restore are never overwritten automatically and can be preserved with `/checkpoint`.
 
-The plugin validates each session's shadow repository before using it. If the current session repository or the workspace reusable repository is invalid, it is preserved beside the replacement as `repo.git.invalid-<timestamp>-<uuid>` and a usable repository is rebuilt automatically. Snapshotting then continues normally, but older snapshots stored only in the invalid repository may be unavailable. Invalid repositories belonging to other sessions are skipped without modifying them.
+The plugin validates each session's shadow repository before using it. If a validated repository disappears while the session is still running, the missing repository is detected and rebuilt automatically. If the current session repository or the workspace reusable repository is invalid, it is preserved beside the replacement as `repo.git.invalid-<timestamp>-<uuid>` before rebuilding. Snapshotting then continues normally, but older snapshots stored only in the missing or invalid repository may be unavailable. Invalid repositories belonging to other sessions are skipped without modifying them.
 
 ## Configuration
 
@@ -164,10 +164,12 @@ Settings:
   - Default: `~/.pi/agent/state/workspace-history`
   - Must be outside the workspace. If it is the workspace itself or a descendant, the plugin is disabled even when `enabled` is `true`, and no history directory is created there.
 - `workspaceHistory.maxSessionsPerWorkspace`
-  - Keep only the most recently used sessions per workspace
+  - Target the total number of stored sessions per workspace by removing the least recently used inactive sessions
+  - Active sessions are never removed, so the total may temporarily exceed this limit
   - Default: `3`
 - `workspaceHistory.maxWorkspaces`
-  - Keep only the most recently used workspaces globally
+  - Target the total number of stored workspaces globally by removing the least recently used inactive workspaces
+  - Workspaces containing active sessions are never removed, so the total may temporarily exceed this limit
   - Default: `10`
 - `workspaceHistory.enabled`
   - `auto` (default) enables the plugin when the current directory or an ancestor contains a declared project marker
@@ -239,6 +241,7 @@ npm run typecheck
 - Hard exclusions remain unmanaged even when `.gitignore` contains negation rules
 - Project markers are detected in ancestor directories for Git, Rust, Go, Python, and other declared project types
 - Invalid shadow repositories are quarantined and rebuilt automatically
+- Concurrent active sessions are protected from retention cleanup
 
 ## Storage Layout
 
@@ -251,6 +254,7 @@ The plugin stores history outside the workspace by default:
       meta.json
       sessions/
         <sessionId>/
+          active-session.json
           repo.git/
           redo.json
           meta.json
@@ -263,6 +267,7 @@ Notes:
 - History is isolated from the user's project `.git` history
 - Invalid shadow repositories are preserved as `repo.git.invalid-<timestamp>-<uuid>` when automatic recovery is needed
 - Old workspace-local `.pi/workspace-history/` state is not migrated automatically
-- Cleanup is LRU-style based on recent use
-- Retention cleanup deletes only non-current entries with valid metadata; entries with damaged metadata are kept for manual recovery
+- Cleanup is LRU-style based on recent use for inactive sessions
+- A process-owned session lease protects active sessions and their workspaces from cleanup. A lease whose process no longer exists is normally treated as inactive; rare PID reuse can conservatively retain old history longer, but cannot make cleanup delete active history
+- Retention cleanup deletes only inactive entries with valid metadata; entries with damaged metadata are kept for manual recovery
 - In `auto` mode, the plugin disables itself in broad directories like the user home folder to avoid expensive scans and startup stalls

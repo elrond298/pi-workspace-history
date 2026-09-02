@@ -136,7 +136,7 @@
 
 在 Windows 上，恢复操作会重试短暂锁定的纳管文件。如果文件持续被占用，导航会取消而不会跳过该文件，并在提示中指出失败的 Git 文件操作。待恢复状态可跨会话或扩展重载保留；恢复失败后产生的新编辑不会被自动覆盖，可先用 `/checkpoint` 保留。
 
-插件会在使用前校验当前 session 的 shadow repo。如果当前 session repo 或工作区 reusable repo 无效，插件会先将其原样保留为同级的 `repo.git.invalid-<timestamp>-<uuid>`，再自动重建可用仓库，后续快照可继续正常工作；但仅存在于无效仓库中的旧快照可能不可用。其他 session 的无效仓库只会被跳过，不会被修改。
+插件会在使用前校验当前 session 的 shadow repo。如果已校验的仓库在 session 运行期间消失，插件会检测并自动重建。如果当前 session repo 或工作区 reusable repo 无效，插件会先将其原样保留为同级的 `repo.git.invalid-<timestamp>-<uuid>`，再自动重建可用仓库。后续快照可继续正常工作，但仅存在于丢失或无效仓库中的旧快照可能不可用。其他 session 的无效仓库只会被跳过，不会被修改。
 
 ## 配置
 
@@ -164,10 +164,12 @@
   - 默认：`~/.pi/agent/state/workspace-history`
   - 必须位于工作区之外。如果它等于工作区或位于工作区内部，即使 `enabled` 为 `true`，插件也会禁用，且不会在其中创建历史目录。
 - `workspaceHistory.maxSessionsPerWorkspace`
-  - 每个工作区最多保留最近使用的 session 数
+  - 通过清理最久未使用的非活跃 session，使每个工作区的 session 总数尽量保持在上限内
+  - 活跃 session 永远不会被清理，因此总数可能暂时超过此上限
   - 默认：`3`
 - `workspaceHistory.maxWorkspaces`
-  - 全局最多保留最近使用的工作区数
+  - 通过清理最久未使用的非活跃工作区，使全局工作区总数尽量保持在上限内
+  - 包含活跃 session 的工作区永远不会被清理，因此总数可能暂时超过此上限
   - 默认：`10`
 - `workspaceHistory.enabled`
   - `auto`（默认）在当前目录或祖先目录存在已声明项目标记时启用
@@ -239,6 +241,7 @@ npm run typecheck
 - 即使 `.gitignore` 使用反向规则，硬排除路径也不会重新被纳管
 - Git、Rust、Go、Python 等项目标记可从祖先目录识别
 - 无效 shadow repo 会自动隔离并重建
+- 并发运行的活跃 session 不会被保留清理误删
 
 ## 存储目录
 
@@ -251,6 +254,7 @@ npm run typecheck
       meta.json
       sessions/
         <sessionId>/
+          active-session.json
           repo.git/
           redo.json
           meta.json
@@ -263,6 +267,7 @@ npm run typecheck
 - shadow git 与用户项目自身的 `.git` 历史隔离
 - 自动恢复时，无效的 shadow repo 会保留为 `repo.git.invalid-<timestamp>-<uuid>`
 - 旧的工作区内 `.pi/workspace-history/` 状态不会自动迁移
-- 清理策略基于最近使用时间（LRU 风格）
-- 保留清理只删除元数据有效且不是当前对象的目录；元数据损坏的目录会保留，便于人工恢复
+- 非活跃 session 按最近使用时间清理（LRU 风格）
+- 进程租约会保护活跃 session 及其工作区。租约对应进程已不存在时通常按非活跃处理；PID 被复用的极少数情况下只会保守地多保留旧历史，不会导致活跃历史被删除
+- 保留清理只删除元数据有效的非活跃目录；元数据损坏的目录会保留，便于人工恢复
 - 在 `auto` 模式下，插件会在像用户 home 目录这样的宽泛目录里自动禁用，避免启动扫描过大导致卡顿

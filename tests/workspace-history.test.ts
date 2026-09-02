@@ -254,6 +254,104 @@ async function waitForText(filePath: string, expected: string, message: string):
   }, message);
 }
 
+async function holdSessionLeaseInChildProcess(sessionRoot: string, sessionId: string): Promise<() => Promise<void>> {
+  const script = [
+    'const fs = require("node:fs");',
+    'const path = require("node:path");',
+    "const [sessionRoot, sessionId] = process.argv.slice(1);",
+    "fs.mkdirSync(sessionRoot, { recursive: true });",
+    'fs.writeFileSync(path.join(sessionRoot, "active-session.json"), `${JSON.stringify({',
+    "  version: 1,",
+    "  sessionId,",
+    '  ownerId: "cross-process-test",',
+    "  processId: process.pid,",
+    "  createdAt: new Date().toISOString(),",
+    '})}\\n`, "utf8");',
+    'process.stdout.write("READY\\n");',
+    "setInterval(() => undefined, 1000);",
+  ].join("\n");
+  const child = spawn(process.execPath, ["-e", script, sessionRoot, sessionId], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const exitPromise = new Promise<void>((resolve) => {
+    child.once("exit", () => resolve());
+  });
+  const hasExited = (): boolean => child.exitCode !== null || child.signalCode !== null;
+  const waitForExitWithin = async (timeoutMs: number): Promise<boolean> => {
+    if (hasExited()) {
+      return true;
+    }
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<boolean>((resolve) => {
+      timeout = setTimeout(() => resolve(false), timeoutMs);
+      timeout.unref();
+    });
+    const exited = await Promise.race([exitPromise.then(() => true), timedOut]);
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+    return exited;
+  };
+  const stopChild = async (): Promise<void> => {
+    if (hasExited()) {
+      return;
+    }
+    child.kill();
+    if (!await waitForExitWithin(2000) && !hasExited()) {
+      child.kill("SIGKILL");
+      await waitForExitWithin(2000);
+    }
+  };
+  let stderr = "";
+  child.stderr.on("data", (chunk) => {
+    stderr += String(chunk);
+  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      let stdout = "";
+      let settled = false;
+      const finish = (error?: Error): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        clearTimeout(timeout);
+        child.stdout.off("data", onStdout);
+        child.off("error", onError);
+        child.off("exit", onExit);
+        if (error) {
+          reject(error);
+        } else {
+          resolve();
+        }
+      };
+      const onStdout = (chunk: Buffer): void => {
+        stdout += String(chunk);
+        if (stdout.includes("READY")) {
+          finish();
+        }
+      };
+      const onError = (error: Error): void => finish(error);
+      const onExit = (code: number | null): void => {
+        finish(new Error(`cross-process lease child exited before ready with code ${code}: ${stderr}`));
+      };
+      const timeout = setTimeout(() => {
+        finish(new Error(`cross-process lease child did not become ready: ${stderr}`));
+      }, 5000);
+      child.stdout.on("data", onStdout);
+      child.once("error", onError);
+      child.once("exit", onExit);
+    });
+  } catch (error) {
+    await stopChild();
+    throw error;
+  }
+
+  return async () => {
+    await stopChild();
+  };
+}
+
 async function holdWindowsFileWithoutDeleteSharing(
   filePath: string,
   tempDir: string,
@@ -1585,6 +1683,228 @@ async function testNewSessionReusesWorkspaceShadowRepo(): Promise<void> {
   }
 }
 
+async function testRetentionCleanupPreservesActiveSessions(): Promise<void> {
+  const ctx1 = await createContext();
+  const contexts: TestContext[] = [ctx1];
+  const sessions: Array<Awaited<ReturnType<typeof createSession>>> = [];
+  try {
+    const session1 = await createSession(ctx1);
+    sessions.push(session1);
+    captureNotifications(session1);
+    ctx1.provider.setResponses([
+      fauxAssistantMessage("created first active session snapshot"),
+    ]);
+    await session1.prompt("create first active session snapshot");
+    await waitFor(
+      async () => await countSnapshots(session1, ctx1.cwd, "after") >= 1,
+      "first active session snapshot was not created",
+    );
+
+    const session1GitDir = getShadowGitDir(session1, ctx1.cwd);
+    const session1LeaseFile = path.join(getSessionHistoryDir(session1, ctx1.cwd), "active-session.json");
+    assert.equal(await pathExists(session1LeaseFile), true, "active session should publish a cleanup lease");
+    const sessionsRoot = path.dirname(getSessionHistoryDir(session1, ctx1.cwd));
+    const expiredSessionRoot = path.join(sessionsRoot, "expired-inactive-session");
+    await mkdir(expiredSessionRoot, { recursive: true });
+    await writeFile(path.join(expiredSessionRoot, "meta.json"), `${JSON.stringify({
+      version: 1,
+      sessionId: "expired-inactive-session",
+      createdAt: "2025-01-01T00:00:00.000Z",
+      lastUsedAt: "2025-01-01T00:00:00.000Z",
+    })}\n`, "utf8");
+    await writeFile(path.join(expiredSessionRoot, "active-session.json"), `${JSON.stringify({
+      version: 1,
+      sessionId: "expired-inactive-session",
+      ownerId: "expired-owner",
+      processId: 2_147_483_647,
+      createdAt: "2025-01-01T00:00:00.000Z",
+    })}\n`, "utf8");
+
+    for (let index = 2; index <= 4; index += 1) {
+      const ctx = await createContextForWorkspace(ctx1.rootDir, ctx1.cwd);
+      contexts.push(ctx);
+      const session = await createSession(ctx);
+      sessions.push(session);
+      captureNotifications(session);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+
+    await waitFor(
+      async () => !await pathExists(expiredSessionRoot),
+      "cleanup should delete an expired inactive session",
+    );
+    assert.equal(
+      await pathExists(session1GitDir),
+      true,
+      "cleanup must preserve the oldest session while it is still active",
+    );
+
+    ctx1.provider.setResponses([
+      fauxAssistantMessage("continued first active session"),
+    ]);
+    await session1.prompt("continue first active session");
+    await waitFor(
+      async () => await countSnapshots(session1, ctx1.cwd, "after") >= 2,
+      "the preserved active session should continue creating snapshots",
+    );
+    await session1.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+    assert.equal(await pathExists(session1LeaseFile), false, "session shutdown should release its cleanup lease");
+  } finally {
+    for (const session of sessions) {
+      session.dispose();
+    }
+    for (const ctx of contexts.slice(1)) {
+      ctx.provider.unregister();
+    }
+    await disposeContext(ctx1);
+  }
+}
+
+async function testRetentionCleanupPreservesActiveWorkspaces(): Promise<void> {
+  const ctx1 = await createContext();
+  let ctx2: TestContext | undefined;
+  const sessions: Array<Awaited<ReturnType<typeof createSession>>> = [];
+  try {
+    const session1 = await createSession(ctx1);
+    sessions.push(session1);
+    captureNotifications(session1);
+    ctx1.provider.setResponses([
+      fauxAssistantMessage("created active workspace snapshot"),
+    ]);
+    await session1.prompt("create active workspace snapshot");
+    await waitFor(
+      async () => await countSnapshots(session1, ctx1.cwd, "after") >= 1,
+      "active workspace snapshot was not created",
+    );
+
+    const activeWorkspaceRoot = path.dirname(path.dirname(getSessionHistoryDir(session1, ctx1.cwd)));
+    const storageDir = getWorkspaceHistoryStateDir(ctx1.rootDir);
+    const expiredWorkspaceRoot = path.join(storageDir, "workspaces", "expired-inactive-workspace");
+    await mkdir(expiredWorkspaceRoot, { recursive: true });
+    await writeFile(path.join(expiredWorkspaceRoot, "meta.json"), `${JSON.stringify({
+      version: 1,
+      workspaceHash: "expired-inactive-workspace",
+      cwd: path.join(ctx1.rootDir, "expired-workspace"),
+      realpath: path.join(ctx1.rootDir, "expired-workspace"),
+      createdAt: "2025-01-01T00:00:00.000Z",
+      lastUsedAt: "2025-01-01T00:00:00.000Z",
+    })}\n`, "utf8");
+
+    const secondWorkspace = path.join(ctx1.rootDir, "workspace-2");
+    await mkdir(secondWorkspace, { recursive: true });
+    ctx2 = await createContextForWorkspace(ctx1.rootDir, secondWorkspace);
+    await writeWorkspaceHistorySettings(ctx2, {
+      storageDir,
+      maxWorkspaces: 1,
+    });
+    const session2 = await createSession(ctx2);
+    sessions.push(session2);
+    captureNotifications(session2);
+
+    await waitFor(
+      async () => !await pathExists(expiredWorkspaceRoot),
+      "cleanup should delete an expired inactive workspace",
+    );
+    assert.equal(
+      await pathExists(activeWorkspaceRoot),
+      true,
+      "cleanup must preserve a different workspace while its session is active",
+    );
+
+    ctx1.provider.setResponses([
+      fauxAssistantMessage("continued active workspace"),
+    ]);
+    await session1.prompt("continue active workspace");
+    await waitFor(
+      async () => await countSnapshots(session1, ctx1.cwd, "after") >= 2,
+      "the preserved active workspace should continue creating snapshots",
+    );
+  } finally {
+    for (const session of sessions) {
+      session.dispose();
+    }
+    ctx2?.provider.unregister();
+    await disposeContext(ctx1);
+  }
+}
+
+async function testRetentionCleanupHonorsCrossProcessLease(): Promise<void> {
+  const ctx1 = await createContext();
+  let ctx2: TestContext | undefined;
+  let releaseLease: (() => Promise<void>) | undefined;
+  const sessions: Array<Awaited<ReturnType<typeof createSession>>> = [];
+  try {
+    await writeWorkspaceHistorySettings(ctx1, {
+      storageDir: getWorkspaceHistoryStateDir(ctx1.rootDir),
+      maxSessionsPerWorkspace: 1,
+    });
+    const workspaceHash = createHash("sha256").update(path.normalize(ctx1.cwd)).digest("hex").slice(0, 24);
+    const sessionsRoot = path.join(
+      getWorkspaceHistoryStateDir(ctx1.rootDir),
+      "workspaces",
+      workspaceHash,
+      "sessions",
+    );
+    const leasedSessionId = "cross-process-active-session";
+    const leasedSessionRoot = path.join(sessionsRoot, leasedSessionId);
+    await mkdir(leasedSessionRoot, { recursive: true });
+    await writeFile(path.join(leasedSessionRoot, "meta.json"), `${JSON.stringify({
+      version: 1,
+      sessionId: leasedSessionId,
+      createdAt: "2025-01-01T00:00:00.000Z",
+      lastUsedAt: "2025-01-01T00:00:00.000Z",
+    })}\n`, "utf8");
+    await writeFile(path.join(leasedSessionRoot, "history-marker.txt"), "preserve while child is active\n", "utf8");
+    const expiredSessionId = "cross-process-expired-session";
+    const expiredSessionRoot = path.join(sessionsRoot, expiredSessionId);
+    await mkdir(expiredSessionRoot, { recursive: true });
+    await writeFile(path.join(expiredSessionRoot, "meta.json"), `${JSON.stringify({
+      version: 1,
+      sessionId: expiredSessionId,
+      createdAt: "2024-01-01T00:00:00.000Z",
+      lastUsedAt: "2024-01-01T00:00:00.000Z",
+    })}\n`, "utf8");
+    releaseLease = await holdSessionLeaseInChildProcess(leasedSessionRoot, leasedSessionId);
+
+    const session1 = await createSession(ctx1);
+    sessions.push(session1);
+    await waitForExists(
+      expiredSessionRoot,
+      false,
+      "the same cleanup pass should remove an expired unleased session",
+    );
+    assert.equal(
+      await pathExists(path.join(leasedSessionRoot, "history-marker.txt")),
+      true,
+      "cleanup must preserve history leased by another live process",
+    );
+
+    await releaseLease();
+    releaseLease = undefined;
+    await session1.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+
+    ctx2 = await createContextForWorkspace(ctx1.rootDir, ctx1.cwd);
+    await writeWorkspaceHistorySettings(ctx2, {
+      storageDir: getWorkspaceHistoryStateDir(ctx1.rootDir),
+      maxSessionsPerWorkspace: 1,
+    });
+    const session2 = await createSession(ctx2);
+    sessions.push(session2);
+    await waitForExists(
+      leasedSessionRoot,
+      false,
+      "cleanup should remove the old session after its lease process exits",
+    );
+  } finally {
+    await releaseLease?.();
+    for (const session of sessions) {
+      session.dispose();
+    }
+    ctx2?.provider.unregister();
+    await disposeContext(ctx1);
+  }
+}
+
 async function testRetentionCleanupRequiresValidMetadata(): Promise<void> {
   const ctx = await createContext();
   try {
@@ -2105,6 +2425,49 @@ async function testInvalidCurrentShadowRepoIsQuarantinedAndRebuilt(): Promise<vo
       "automatic recovery should notify the user once",
     );
 
+    session.dispose();
+  } finally {
+    await disposeContext(ctx);
+  }
+}
+
+async function testMissingCachedShadowRepoIsRebuilt(): Promise<void> {
+  const ctx = await createContext();
+  try {
+    const session = await createSession(ctx);
+    const notifications = captureNotifications(session);
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "before-repo-loss.txt", content: "before\n" })]),
+      fauxAssistantMessage("created state before repo loss"),
+    ]);
+    await session.prompt("create state before repo loss");
+    await waitFor(
+      async () => await countSnapshots(session, ctx.cwd, "after") >= 1,
+      "snapshot before repo loss was not created",
+    );
+
+    const gitDir = getShadowGitDir(session, ctx.cwd);
+    await rm(gitDir, { recursive: true, force: true });
+    assert.equal(await pathExists(gitDir), false, "the cached shadow repo should be removed for the recovery fixture");
+
+    ctx.provider.setResponses([
+      fauxAssistantMessage([fauxToolCall("write", { path: "after-repo-loss.txt", content: "after\n" })]),
+      fauxAssistantMessage("continued after repo loss"),
+    ]);
+    await session.prompt("continue after repo loss");
+    await waitFor(
+      async () => await countSnapshots(session, ctx.cwd, "after") >= 2,
+      "the session should continue creating snapshots after rebuilding a missing repo",
+    );
+
+    assert.equal(await readFile(path.join(ctx.cwd, "before-repo-loss.txt"), "utf8"), "before\n");
+    assert.equal(await readFile(path.join(ctx.cwd, "after-repo-loss.txt"), "utf8"), "after\n");
+    await assertValidShadowRepo(gitDir, ctx.cwd, "rebuilt missing cached shadow repo");
+    assert.equal(
+      notifications.filter((message) => message.includes("missing or invalid snapshot repository")).length,
+      1,
+      "missing cached repo recovery should notify the user once",
+    );
     session.dispose();
   } finally {
     await disposeContext(ctx);
@@ -3034,7 +3397,11 @@ async function main(): Promise<void> {
     { name: "retention cleanup requires valid metadata", run: testRetentionCleanupRequiresValidMetadata },
     { name: "retention cleanup logs deletion failure", run: testRetentionCleanupLogsDeletionFailure },
     { name: "new session reuses workspace shadow repo", run: testNewSessionReusesWorkspaceShadowRepo },
+    { name: "retention cleanup preserves active sessions", run: testRetentionCleanupPreservesActiveSessions },
+    { name: "retention cleanup preserves active workspaces", run: testRetentionCleanupPreservesActiveWorkspaces },
+    { name: "retention cleanup honors a cross-process lease", run: testRetentionCleanupHonorsCrossProcessLease },
     { name: "invalid current shadow repo is quarantined and rebuilt", run: testInvalidCurrentShadowRepoIsQuarantinedAndRebuilt },
+    { name: "missing cached shadow repo is rebuilt", run: testMissingCachedShadowRepoIsRebuilt },
     { name: "invalid reusable shadow repo is quarantined and rebuilt", run: testInvalidReusableShadowRepoIsQuarantinedAndRebuilt },
     { name: "failed shadow repo rebuild does not leave canonical repo", run: testFailedShadowRepoRebuildDoesNotLeaveCanonicalRepo },
     { name: "stale shadow repo lock is recovered", run: testStaleShadowRepoLockIsRecovered },
