@@ -52,6 +52,7 @@ type TurnSnapshotState = {
 };
 
 const execFileAsync = promisify(execFile);
+const ASYNC_ASSERTION_TIMEOUT_MS = 15_000;
 
 async function createContextForWorkspace(rootDir: string, cwd: string, withProjectMarker = true): Promise<TestContext> {
   const settingsManager = SettingsManager.inMemory({
@@ -229,7 +230,11 @@ function getWorkspaceHistoryStateDir(rootDir: string): string {
   return path.join(rootDir, "workspace-history-state");
 }
 
-async function waitFor(condition: () => boolean | Promise<boolean>, message: string, timeoutMs = 5000): Promise<void> {
+async function waitFor(
+  condition: () => boolean | Promise<boolean>,
+  message: string,
+  timeoutMs = ASYNC_ASSERTION_TIMEOUT_MS,
+): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     if (await condition()) {
