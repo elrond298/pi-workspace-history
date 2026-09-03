@@ -25,7 +25,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 
 const SNAPSHOT_TYPE = "workspace-history.snapshot";
-const SNAPSHOT_RETENTION_REF_PREFIX = "refs/workspace-history/snapshots";
+const SNAPSHOT_RETENTION_REF_PREFIX = "refs/wh/s";
 const ACTIVE_SESSION_LEASE_FILE = "active-session.json";
 
 const DEFAULT_MAX_SESSIONS_PER_WORKSPACE = 3;

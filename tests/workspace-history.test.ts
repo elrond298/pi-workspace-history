@@ -52,6 +52,7 @@ type TurnSnapshotState = {
 };
 
 const workspaceHashByCwd = new Map<string, string>();
+const SNAPSHOT_RETENTION_REF_PREFIX = "refs/wh/s";
 
 const execFileAsync = promisify(execFile);
 
@@ -1932,10 +1933,13 @@ async function testNewSessionReusesWorkspaceShadowRepo(): Promise<void> {
     const session1GitDir = getShadowGitDir(session1, ctx1.cwd);
     const retainedSessionRefs = await execFileAsync(
       "git",
-      ["--git-dir", session1GitDir, "for-each-ref", "--format=%(refname)", "refs/workspace-history"],
+      ["--git-dir", session1GitDir, "for-each-ref", "--format=%(refname)", SNAPSHOT_RETENTION_REF_PREFIX],
       { cwd: ctx1.cwd },
     );
-    assert.match(retainedSessionRefs.stdout, /refs\/workspace-history\/snapshots\//, "session repo should retain snapshot refs");
+    assert.ok(
+      retainedSessionRefs.stdout.includes(`${SNAPSHOT_RETENTION_REF_PREFIX}/`),
+      "session repo should retain snapshot refs",
+    );
     session1.dispose();
 
     const ctx2 = await createContextForWorkspace(ctx1.rootDir, ctx1.cwd);
@@ -1959,12 +1963,12 @@ async function testNewSessionReusesWorkspaceShadowRepo(): Promise<void> {
 
     const secondSessionSnapshots = (await readTurnSnapshots(session2, ctx2.cwd)).turns;
     const expectedRetentionRefs = new Set(secondSessionSnapshots.flatMap((turn) => [
-      `refs/workspace-history/snapshots/${turn.beforeCommit}`,
-      `refs/workspace-history/snapshots/${turn.afterCommit}`,
+      `${SNAPSHOT_RETENTION_REF_PREFIX}/${turn.beforeCommit}`,
+      `${SNAPSHOT_RETENTION_REF_PREFIX}/${turn.afterCommit}`,
     ]));
     const inheritedRetentionRefs = await execFileAsync(
       "git",
-      ["--git-dir", gitDir, "for-each-ref", "--format=%(refname)", "refs/workspace-history"],
+      ["--git-dir", gitDir, "for-each-ref", "--format=%(refname)", SNAPSHOT_RETENTION_REF_PREFIX],
       { cwd: ctx1.cwd },
     );
     assert.deepEqual(
@@ -3555,7 +3559,7 @@ async function testBranchSnapshotsSurviveGitPrune(): Promise<void> {
 
     await execFileAsync(
       "git",
-      ["--git-dir", gitDir, "update-ref", "-d", `refs/workspace-history/snapshots/${cCommit}`],
+      ["--git-dir", gitDir, "update-ref", "-d", `${SNAPSHOT_RETENTION_REF_PREFIX}/${cCommit}`],
       { cwd: ctx.cwd },
     );
     await pruneUnreachableGitObjects(gitDir, ctx.cwd);
@@ -3593,7 +3597,7 @@ async function testMissingPreviousSnapshotFallsBackToFreshBefore(): Promise<void
     await execFileAsync("git", ["--git-dir", gitDir, "update-ref", headRef, first.beforeCommit], { cwd: ctx.cwd });
     await execFileAsync(
       "git",
-      ["--git-dir", gitDir, "update-ref", "-d", `refs/workspace-history/snapshots/${first.afterCommit}`],
+      ["--git-dir", gitDir, "update-ref", "-d", `${SNAPSHOT_RETENTION_REF_PREFIX}/${first.afterCommit}`],
       { cwd: ctx.cwd },
     );
     await pruneUnreachableGitObjects(gitDir, ctx.cwd);
@@ -3632,7 +3636,7 @@ async function testSessionStartRebuildsSnapshotRetentionRefs(): Promise<void> {
 
     const refs = await execFileAsync(
       "git",
-      ["--git-dir", gitDir, "for-each-ref", "--format=%(refname)", "refs/workspace-history"],
+      ["--git-dir", gitDir, "for-each-ref", "--format=%(refname)", SNAPSHOT_RETENTION_REF_PREFIX],
       { cwd: ctx1.cwd },
     );
     for (const ref of refs.stdout.split(/\r?\n/).filter((value) => value.length > 0)) {
@@ -3644,7 +3648,7 @@ async function testSessionStartRebuildsSnapshotRetentionRefs(): Promise<void> {
     await waitFor(async () => {
       const rebuiltRefs = await execFileAsync(
         "git",
-        ["--git-dir", gitDir, "for-each-ref", "--format=%(refname)", "refs/workspace-history"],
+        ["--git-dir", gitDir, "for-each-ref", "--format=%(refname)", SNAPSHOT_RETENTION_REF_PREFIX],
         { cwd: ctx1.cwd },
       );
       return rebuiltRefs.stdout.includes(turn.beforeCommit) && rebuiltRefs.stdout.includes(turn.afterCommit);
