@@ -1,5 +1,4 @@
-import { access, copyFile, mkdtemp, mkdir, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
-import { realpathSync } from "node:fs";
+import { access, copyFile, mkdtemp, mkdir, readFile, readdir, realpath, rm, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import assert from "node:assert/strict";
@@ -52,6 +51,8 @@ type TurnSnapshotState = {
   }>;
 };
 
+const workspaceHashByCwd = new Map<string, string>();
+
 const execFileAsync = promisify(execFile);
 
 async function hasJujutsu(): Promise<boolean> {
@@ -81,6 +82,11 @@ async function getJujutsuOperationId(cwd: string): Promise<string> {
 const ASYNC_ASSERTION_TIMEOUT_MS = 15_000;
 
 async function createContextForWorkspace(rootDir: string, cwd: string, withProjectMarker = true): Promise<TestContext> {
+  const resolvedCwd = await realpath(cwd).catch(() => path.resolve(cwd));
+  workspaceHashByCwd.set(
+    path.normalize(cwd),
+    createHash("sha256").update(path.normalize(resolvedCwd)).digest("hex").slice(0, 24),
+  );
   const settingsManager = SettingsManager.inMemory({
     compaction: { enabled: false },
     retry: { enabled: false, maxRetries: 0 },
@@ -171,6 +177,7 @@ async function writeWorkspaceHistorySettings(
 }
 
 async function disposeContext(ctx: TestContext): Promise<void> {
+  workspaceHashByCwd.delete(path.normalize(ctx.cwd));
   await rm(ctx.rootDir, {
     recursive: true,
     force: true,
@@ -477,13 +484,9 @@ async function holdWindowsFileWithoutDeleteSharing(
 }
 
 function getWorkspaceHash(cwd: string): string {
-  let resolvedCwd: string;
-  try {
-    resolvedCwd = realpathSync(cwd);
-  } catch {
-    resolvedCwd = path.resolve(cwd);
-  }
-  return createHash("sha256").update(path.normalize(resolvedCwd)).digest("hex").slice(0, 24);
+  const workspaceHash = workspaceHashByCwd.get(path.normalize(cwd));
+  assert.ok(workspaceHash, `workspace hash was not registered for ${cwd}`);
+  return workspaceHash;
 }
 
 function getSessionHistoryDir(session: Awaited<ReturnType<typeof createSession>>, cwd: string): string {
