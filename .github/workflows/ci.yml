@@ -22,7 +22,7 @@ jobs:
         if: runner.os == 'Linux'
         uses: taiki-e/install-action@v2
         with:
-          tool: jj-cli@0.45.0
+          tool: jj-cli@0.44.0
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
