@@ -59,6 +59,9 @@ async function hasJujutsu(): Promise<boolean> {
     return true;
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      if (process.env.PI_WORKSPACE_HISTORY_REQUIRE_JUJUTSU === "1") {
+        throw new Error("Jujutsu is required for this test run, but jj was not found on PATH");
+      }
       return false;
     }
     throw error;
