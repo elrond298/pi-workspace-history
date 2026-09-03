@@ -3559,9 +3559,13 @@ async function testBranchSnapshotsSurviveGitPrune(): Promise<void> {
 }
 
 async function testMissingPreviousSnapshotFallsBackToFreshBefore(): Promise<void> {
-  const ctx = await createContext();
+  const previousLogging = process.env.PI_WORKSPACE_HISTORY_LOG;
+  process.env.PI_WORKSPACE_HISTORY_LOG = "1";
+  let ctx: TestContext | undefined;
   try {
+    ctx = await createContext();
     const session = await createSession(ctx);
+    const notifications = captureNotifications(session);
     ctx.provider.setResponses([
       fauxAssistantMessage([fauxToolCall("write", { path: "missing-snapshot.txt", content: "first\n" })]),
       fauxAssistantMessage("created first state"),
@@ -3569,7 +3573,16 @@ async function testMissingPreviousSnapshotFallsBackToFreshBefore(): Promise<void
     ]);
 
     await session.prompt("create first state");
-    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") === 1, "first snapshot missing");
+    try {
+      await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") === 1, "first snapshot missing");
+    } catch (error) {
+      const logFile = path.join(getWorkspaceHistoryStateDir(ctx.rootDir), "logs", "timemachine.log");
+      const diagnosticLog = await readFile(logFile, "utf8").catch((logError) => `Unable to read ${logFile}: ${String(logError)}`);
+      throw new Error(
+        `First snapshot diagnostic failed. Notifications: ${notifications.join(" | ") || "none"}\n${diagnosticLog}`,
+        { cause: error },
+      );
+    }
     const first = (await readTurnSnapshots(session, ctx.cwd)).turns[0];
     assert.ok(first, "first turn snapshot should exist");
     assert.notEqual(first.beforeCommit, first.afterCommit, "fixture requires a distinct after commit");
@@ -3594,7 +3607,14 @@ async function testMissingPreviousSnapshotFallsBackToFreshBefore(): Promise<void
     await execFileAsync("git", ["--git-dir", gitDir, "cat-file", "-e", `${recovered.beforeCommit}^{commit}`], { cwd: ctx.cwd });
     session.dispose();
   } finally {
-    await disposeContext(ctx);
+    if (previousLogging === undefined) {
+      delete process.env.PI_WORKSPACE_HISTORY_LOG;
+    } else {
+      process.env.PI_WORKSPACE_HISTORY_LOG = previousLogging;
+    }
+    if (ctx) {
+      await disposeContext(ctx);
+    }
   }
 }
 
