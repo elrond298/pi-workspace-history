@@ -77,7 +77,7 @@ async function getJujutsuOperationId(cwd: string): Promise<string> {
   return stdout.trim();
 }
 
-const ASYNC_ASSERTION_TIMEOUT_MS = 15_000;
+const ASYNC_ASSERTION_TIMEOUT_MS = process.env.CI ? 30_000 : 15_000;
 
 async function createContextForWorkspace(rootDir: string, cwd: string, withProjectMarker = true): Promise<TestContext> {
   const settingsManager = SettingsManager.inMemory({
@@ -170,17 +170,12 @@ async function writeWorkspaceHistorySettings(
 }
 
 async function disposeContext(ctx: TestContext): Promise<void> {
-  for (let attempt = 0; attempt < 5; attempt += 1) {
-    try {
-      await rm(ctx.rootDir, { recursive: true, force: true });
-      return;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EBUSY") {
-        throw error;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 150));
-    }
-  }
+  await rm(ctx.rootDir, {
+    recursive: true,
+    force: true,
+    maxRetries: 10,
+    retryDelay: 100,
+  });
 }
 
 async function createSession(ctx: TestContext, sessionManager: SessionManager = SessionManager.inMemory(ctx.cwd)) {
