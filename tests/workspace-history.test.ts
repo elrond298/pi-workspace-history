@@ -2952,7 +2952,7 @@ async function testFailedShadowRepoRebuildDoesNotLeaveCanonicalRepo(): Promise<v
 
       await assert.rejects(
         session2.prompt("create after rebuild retry"),
-        /Unable to rebuild shadow repository[\s\S]*(?:tree|object)/i,
+        /Unable to rebuild shadow repository[\s\S]*(?:tree|object|does not appear to be a git repository)/i,
         "a corrupt reusable source should surface the Git rebuild failure",
       );
       assert.equal(await pathExists(session2GitDir), false, "failed rebuild should not leave a repo at the canonical path");
