@@ -77,7 +77,7 @@ async function getJujutsuOperationId(cwd: string): Promise<string> {
   return stdout.trim();
 }
 
-const ASYNC_ASSERTION_TIMEOUT_MS = process.env.CI ? 30_000 : 15_000;
+const ASYNC_ASSERTION_TIMEOUT_MS = process.env.CI && process.platform === "win32" ? 60_000 : 15_000;
 
 async function createContextForWorkspace(rootDir: string, cwd: string, withProjectMarker = true): Promise<TestContext> {
   const settingsManager = SettingsManager.inMemory({
