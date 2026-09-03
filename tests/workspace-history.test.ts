@@ -1939,12 +1939,25 @@ async function testNewSessionReusesWorkspaceShadowRepo(): Promise<void> {
     await waitFor(async () => await pathExists(path.join(gitDir, "objects")), "second session shadow git repo should exist", 10000);
     const head = await readFile(path.join(gitDir, "HEAD"), "utf8");
     assert.match(head, /refs\/heads|[0-9a-f]{40}/, "second session should have a cloned shadow repo with HEAD");
+    ctx2.provider.setResponses([fauxAssistantMessage("verified reusable shadow state")]);
+    await session2.prompt("verify reusable shadow state");
+    await waitFor(async () => await countSnapshots(session2, ctx2.cwd, "after") >= 1, "second session snapshot was not created");
+
+    const secondSessionSnapshots = (await readTurnSnapshots(session2, ctx2.cwd)).turns;
+    const expectedRetentionRefs = new Set(secondSessionSnapshots.flatMap((turn) => [
+      `refs/workspace-history/snapshots/${turn.beforeCommit}`,
+      `refs/workspace-history/snapshots/${turn.afterCommit}`,
+    ]));
     const inheritedRetentionRefs = await execFileAsync(
       "git",
       ["--git-dir", gitDir, "for-each-ref", "--format=%(refname)", "refs/workspace-history"],
       { cwd: ctx1.cwd },
     );
-    assert.equal(inheritedRetentionRefs.stdout.trim(), "", "new sessions should not inherit another session's retention refs");
+    assert.deepEqual(
+      new Set(inheritedRetentionRefs.stdout.trim().split(/\r?\n/).filter(Boolean)),
+      expectedRetentionRefs,
+      "new sessions should retain only commits referenced by their own history",
+    );
 
     session2.dispose();
     ctx2.provider.unregister();
