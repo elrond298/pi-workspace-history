@@ -1,4 +1,5 @@
 import { access, copyFile, mkdtemp, mkdir, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
+import { realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import assert from "node:assert/strict";
@@ -77,7 +78,7 @@ async function getJujutsuOperationId(cwd: string): Promise<string> {
   return stdout.trim();
 }
 
-const ASYNC_ASSERTION_TIMEOUT_MS = process.env.CI && process.platform === "win32" ? 60_000 : 15_000;
+const ASYNC_ASSERTION_TIMEOUT_MS = 15_000;
 
 async function createContextForWorkspace(rootDir: string, cwd: string, withProjectMarker = true): Promise<TestContext> {
   const settingsManager = SettingsManager.inMemory({
@@ -475,8 +476,18 @@ async function holdWindowsFileWithoutDeleteSharing(
   };
 }
 
+function getWorkspaceHash(cwd: string): string {
+  let resolvedCwd: string;
+  try {
+    resolvedCwd = realpathSync(cwd);
+  } catch {
+    resolvedCwd = path.resolve(cwd);
+  }
+  return createHash("sha256").update(path.normalize(resolvedCwd)).digest("hex").slice(0, 24);
+}
+
 function getSessionHistoryDir(session: Awaited<ReturnType<typeof createSession>>, cwd: string): string {
-  const workspaceHash = createHash("sha256").update(path.normalize(cwd)).digest("hex").slice(0, 24);
+  const workspaceHash = getWorkspaceHash(cwd);
   return path.join(
     getWorkspaceHistoryStateDir(path.dirname(cwd)),
     "workspaces",
@@ -1926,7 +1937,7 @@ async function testNewSessionReusesWorkspaceShadowRepo(): Promise<void> {
 
     const ctx2 = await createContextForWorkspace(ctx1.rootDir, ctx1.cwd);
     const session2 = await createSession(ctx2);
-    const workspaceHash = createHash("sha256").update(path.normalize(ctx1.cwd)).digest("hex").slice(0, 24);
+    const workspaceHash = getWorkspaceHash(ctx1.cwd);
     const gitDir = path.join(
       getWorkspaceHistoryStateDir(ctx1.rootDir),
       "workspaces",
@@ -2121,7 +2132,7 @@ async function testRetentionCleanupHonorsCrossProcessLease(): Promise<void> {
       storageDir: getWorkspaceHistoryStateDir(ctx1.rootDir),
       maxSessionsPerWorkspace: 1,
     });
-    const workspaceHash = createHash("sha256").update(path.normalize(ctx1.cwd)).digest("hex").slice(0, 24);
+    const workspaceHash = getWorkspaceHash(ctx1.cwd);
     const sessionsRoot = path.join(
       getWorkspaceHistoryStateDir(ctx1.rootDir),
       "workspaces",
@@ -2197,7 +2208,7 @@ async function testRetentionCleanupRequiresValidMetadata(): Promise<void> {
       maxWorkspaces: 2,
     });
     const storageDir = getWorkspaceHistoryStateDir(ctx.rootDir);
-    const workspaceHash = createHash("sha256").update(path.normalize(ctx.cwd)).digest("hex").slice(0, 24);
+    const workspaceHash = getWorkspaceHash(ctx.cwd);
     const workspaceRoot = path.join(storageDir, "workspaces", workspaceHash);
     const sessionsRoot = path.join(workspaceRoot, "sessions");
 
@@ -2269,7 +2280,7 @@ async function testRetentionCleanupLogsDeletionFailure(): Promise<void> {
       storageDir: getWorkspaceHistoryStateDir(ctx.rootDir),
       maxSessionsPerWorkspace: 1,
     });
-    const workspaceHash = createHash("sha256").update(path.normalize(ctx.cwd)).digest("hex").slice(0, 24);
+    const workspaceHash = getWorkspaceHash(ctx.cwd);
     const oldSessionRoot = path.join(
       getWorkspaceHistoryStateDir(ctx.rootDir),
       "workspaces",
@@ -2977,7 +2988,7 @@ async function testStaleShadowRepoLockIsRecovered(): Promise<void> {
       fauxAssistantMessage("created lock recovery file"),
     ]);
 
-    const workspaceHash = createHash("sha256").update(path.normalize(ctx.cwd)).digest("hex").slice(0, 24);
+    const workspaceHash = getWorkspaceHash(ctx.cwd);
     const sessionRoot = path.join(
       getWorkspaceHistoryStateDir(ctx.rootDir),
       "workspaces",
@@ -3122,7 +3133,7 @@ async function testRestoreFailureDoesNotDeleteCurrentWorkspace(): Promise<void> 
     await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") >= 1, "safe file after snapshot was not created");
 
     const sessionId = session.sessionManager.getSessionId();
-    const workspaceHash = createHash("sha256").update(ctx.cwd).digest("hex").slice(0, 24);
+    const workspaceHash = getWorkspaceHash(ctx.cwd);
     const workspaceRoot = path.join(getWorkspaceHistoryStateDir(ctx.rootDir), "workspaces", workspaceHash);
     const gitDir = path.join(workspaceRoot, "sessions", sessionId, "repo.git");
     await rm(gitDir, { recursive: true, force: true });
@@ -3559,13 +3570,9 @@ async function testBranchSnapshotsSurviveGitPrune(): Promise<void> {
 }
 
 async function testMissingPreviousSnapshotFallsBackToFreshBefore(): Promise<void> {
-  const previousLogging = process.env.PI_WORKSPACE_HISTORY_LOG;
-  process.env.PI_WORKSPACE_HISTORY_LOG = "1";
-  let ctx: TestContext | undefined;
+  const ctx = await createContext();
   try {
-    ctx = await createContext();
     const session = await createSession(ctx);
-    const notifications = captureNotifications(session);
     ctx.provider.setResponses([
       fauxAssistantMessage([fauxToolCall("write", { path: "missing-snapshot.txt", content: "first\n" })]),
       fauxAssistantMessage("created first state"),
@@ -3573,16 +3580,7 @@ async function testMissingPreviousSnapshotFallsBackToFreshBefore(): Promise<void
     ]);
 
     await session.prompt("create first state");
-    try {
-      await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") === 1, "first snapshot missing");
-    } catch (error) {
-      const logFile = path.join(getWorkspaceHistoryStateDir(ctx.rootDir), "logs", "timemachine.log");
-      const diagnosticLog = await readFile(logFile, "utf8").catch((logError) => `Unable to read ${logFile}: ${String(logError)}`);
-      throw new Error(
-        `First snapshot diagnostic failed. Notifications: ${notifications.join(" | ") || "none"}\n${diagnosticLog}`,
-        { cause: error },
-      );
-    }
+    await waitFor(async () => await countSnapshots(session, ctx.cwd, "after") === 1, "first snapshot missing");
     const first = (await readTurnSnapshots(session, ctx.cwd)).turns[0];
     assert.ok(first, "first turn snapshot should exist");
     assert.notEqual(first.beforeCommit, first.afterCommit, "fixture requires a distinct after commit");
@@ -3607,14 +3605,7 @@ async function testMissingPreviousSnapshotFallsBackToFreshBefore(): Promise<void
     await execFileAsync("git", ["--git-dir", gitDir, "cat-file", "-e", `${recovered.beforeCommit}^{commit}`], { cwd: ctx.cwd });
     session.dispose();
   } finally {
-    if (previousLogging === undefined) {
-      delete process.env.PI_WORKSPACE_HISTORY_LOG;
-    } else {
-      process.env.PI_WORKSPACE_HISTORY_LOG = previousLogging;
-    }
-    if (ctx) {
-      await disposeContext(ctx);
-    }
+    await disposeContext(ctx);
   }
 }
 
